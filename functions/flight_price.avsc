@@ -1,0 +1,18 @@
+{
+  "type": "record",
+  "name": "FlightPrice",
+  "namespace": "com.skypulse",
+  "fields": [
+    {"name": "route_id",            "type": "string"},
+    {"name": "origin",              "type": "string"},
+    {"name": "destination",         "type": "string"},
+    {"name": "airline_code",        "type": "string"},
+    {"name": "airline_name",        "type": "string"},
+    {"name": "flight_number",       "type": "string"},
+    {"name": "price_usd",           "type": "double"},
+    {"name": "flight_date",         "type": "string"},
+    {"name": "scheduled_departure", "type": "string"},
+    {"name": "event_timestamp",     "type": "long"},
+    {"name": "ingestion_timestamp", "type": "long"}
+  ]
+}

@@ -1,0 +1,32 @@
+# Virtual environments
+venv/
+env/
+.env
+
+# API keys and credentials
+*.json.key
+application_default_credentials.json
+*credentials*.json
+
+# Environment variable files
+.env
+.env.local
+*.env
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+
+# GCP credentials
+gcloud/
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
