@@ -6,7 +6,7 @@ from collections import Counter
 from google.cloud import storage
 
 # Configuration
-AVIATIONSTACK_API_KEY = "0a8b77b40fa7430d95bb60ffc6c75462"
+AVIATIONSTACK_API_KEY = AVIATIONSTACK_API_KEY = os.environ.get("AVIATIONSTACK_API_KEY")
 BUCKET_NAME = "skypulse-triptide"
 DEP_IATA = "ORD"
 TOP_ROUTES_COUNT = 20
