@@ -1,3 +1,4 @@
 google-cloud-storage==2.16.0
 google-cloud-pubsub==2.21.0
 fastavro==1.9.4
+pytz==2024.1

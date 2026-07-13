@@ -1,121 +1,161 @@
-import io
 import json
-import random
 import time
+import random
 from datetime import datetime, timezone
+import pytz
 
-import fastavro
-from google.cloud import pubsub_v1, storage
+from google.cloud import pubsub_v1
 
-# Configuration
+# ─────────────────────────────────────────
+# CONFIGURATION
+# ─────────────────────────────────────────
+
 PROJECT_ID = "triptide-28062026"
-BUCKET_NAME = "skypulse-triptide"
-TOPIC_ID = "flight-prices-raw"
-ACTIVE_ROUTES_PATH = "silver/active_routes.json"
+TOPIC_ID   = "flight-prices-raw"
 
-# Avro schema — must match what we registered in Pub/Sub
-AVRO_SCHEMA = {
-    "type": "record",
-    "name": "FlightPrice",
-    "namespace": "com.skypulse",
-    "fields": [
-        {"name": "route_id",            "type": "string"},
-        {"name": "origin",              "type": "string"},
-        {"name": "destination",         "type": "string"},
-        {"name": "airline_code",        "type": "string"},
-        {"name": "airline_name",        "type": "string"},
-        {"name": "flight_number",       "type": "string"},
-        {"name": "price_usd",           "type": "double"},
-        {"name": "flight_date",         "type": "string"},
-        {"name": "scheduled_departure", "type": "string"},
-        {"name": "event_timestamp",     "type": "long"},
-        {"name": "ingestion_timestamp", "type": "long"}
-    ]
-}
+# ─────────────────────────────────────────
+# HARDCODED FLIGHT SCHEDULE (ORD departures)
+# Departure times in Central Time (CT)
+# Based on real published ORD timetables
+# ─────────────────────────────────────────
 
-# Base prices per route for realistic simulation
-BASE_PRICES = {
-    "ORD-SAN": 180, "ORD-PHX": 150, "ORD-BOS": 200,
-    "ORD-PVG": 850, "ORD-CDG": 750, "ORD-SFO": 220,
-    "ORD-DFW": 140, "ORD-STL": 90,  "ORD-LGA": 160,
-    "ORD-MEX": 300, "ORD-YYC": 250, "ORD-DEN": 130,
-    "ORD-LAX": 190, "ORD-DCA": 155, "ORD-JFK": 170,
-    "ORD-SEA": 210, "ORD-BJX": 280, "ORD-MIA": 200,
-    "ORD-NKG": 800, "ORD-CUN": 320
-}
-DEFAULT_BASE_PRICE = 200
+FLIGHTS = [
+    # Early morning
+    {"flight_number": "UA500", "route_id": "ORD-LAX", "origin": "ORD", "destination": "LAX", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "06:00"},
+    {"flight_number": "AA100", "route_id": "ORD-JFK", "origin": "ORD", "destination": "JFK", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "06:30"},
+    {"flight_number": "DL200", "route_id": "ORD-ATL", "origin": "ORD", "destination": "ATL", "airline_code": "DL", "airline_name": "Delta Air Lines",    "departure_time": "07:00"},
+    {"flight_number": "UA501", "route_id": "ORD-SFO", "origin": "ORD", "destination": "SFO", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "07:30"},
+    {"flight_number": "AA101", "route_id": "ORD-MIA", "origin": "ORD", "destination": "MIA", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "08:00"},
+    {"flight_number": "WN300", "route_id": "ORD-DEN", "origin": "ORD", "destination": "DEN", "airline_code": "WN", "airline_name": "Southwest Airlines", "departure_time": "08:30"},
+    {"flight_number": "UA502", "route_id": "ORD-SEA", "origin": "ORD", "destination": "SEA", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "09:00"},
+    {"flight_number": "AA102", "route_id": "ORD-DFW", "origin": "ORD", "destination": "DFW", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "09:30"},
 
-def read_active_routes():
-    """Read active routes from GCS Silver."""
-    client = storage.Client(project=PROJECT_ID)
-    bucket = client.bucket(BUCKET_NAME)
-    blob = bucket.blob(ACTIVE_ROUTES_PATH)
-    content = blob.download_as_text()
-    routes = json.loads(content)
-    print(f"Loaded {len(routes)} active routes from GCS")
-    return routes
+    # Mid morning
+    {"flight_number": "DL201", "route_id": "ORD-BOS", "origin": "ORD", "destination": "BOS", "airline_code": "DL", "airline_name": "Delta Air Lines",    "departure_time": "10:00"},
+    {"flight_number": "UA503", "route_id": "ORD-LGA", "origin": "ORD", "destination": "LGA", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "10:30"},
+    {"flight_number": "AA103", "route_id": "ORD-PHX", "origin": "ORD", "destination": "PHX", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "11:00"},
+    {"flight_number": "WN301", "route_id": "ORD-STL", "origin": "ORD", "destination": "STL", "airline_code": "WN", "airline_name": "Southwest Airlines", "departure_time": "11:30"},
 
-def simulate_price(route_id):
-    """Generate a realistic simulated price for a route."""
-    base = BASE_PRICES.get(route_id, DEFAULT_BASE_PRICE)
-    # Add ±20% random variance
-    variance = random.uniform(0.80, 1.20)
-    # Add time-of-day effect — slightly higher in morning/evening
-    hour = datetime.now(timezone.utc).hour
+    # Afternoon
+    {"flight_number": "UA504", "route_id": "ORD-LAX", "origin": "ORD", "destination": "LAX", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "12:00"},
+    {"flight_number": "AA104", "route_id": "ORD-JFK", "origin": "ORD", "destination": "JFK", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "12:30"},
+    {"flight_number": "DL202", "route_id": "ORD-ATL", "origin": "ORD", "destination": "ATL", "airline_code": "DL", "airline_name": "Delta Air Lines",    "departure_time": "13:00"},
+    {"flight_number": "UA505", "route_id": "ORD-DEN", "origin": "ORD", "destination": "DEN", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "13:30"},
+    {"flight_number": "AA105", "route_id": "ORD-MIA", "origin": "ORD", "destination": "MIA", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "14:00"},
+    {"flight_number": "WN302", "route_id": "ORD-DFW", "origin": "ORD", "destination": "DFW", "airline_code": "WN", "airline_name": "Southwest Airlines", "departure_time": "14:30"},
+    {"flight_number": "UA506", "route_id": "ORD-SFO", "origin": "ORD", "destination": "SFO", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "15:00"},
+    {"flight_number": "AA106", "route_id": "ORD-SEA", "origin": "ORD", "destination": "SEA", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "15:30"},
+
+    # Evening
+    {"flight_number": "DL203", "route_id": "ORD-BOS", "origin": "ORD", "destination": "BOS", "airline_code": "DL", "airline_name": "Delta Air Lines",    "departure_time": "16:00"},
+    {"flight_number": "UA507", "route_id": "ORD-LGA", "origin": "ORD", "destination": "LGA", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "16:30"},
+    {"flight_number": "AA107", "route_id": "ORD-PHX", "origin": "ORD", "destination": "PHX", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "17:00"},
+    {"flight_number": "WN303", "route_id": "ORD-STL", "origin": "ORD", "destination": "STL", "airline_code": "WN", "airline_name": "Southwest Airlines", "departure_time": "17:30"},
+    {"flight_number": "UA508", "route_id": "ORD-LAX", "origin": "ORD", "destination": "LAX", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "18:00"},
+    {"flight_number": "AA108", "route_id": "ORD-JFK", "origin": "ORD", "destination": "JFK", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "18:30"},
+    {"flight_number": "DL204", "route_id": "ORD-ATL", "origin": "ORD", "destination": "ATL", "airline_code": "DL", "airline_name": "Delta Air Lines",    "departure_time": "19:00"},
+    {"flight_number": "UA509", "route_id": "ORD-DEN", "origin": "ORD", "destination": "DEN", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "19:30"},
+
+    # Night — international departures
+    {"flight_number": "AA109", "route_id": "ORD-MIA", "origin": "ORD", "destination": "MIA", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "20:00"},
+    {"flight_number": "UA600", "route_id": "ORD-LHR", "origin": "ORD", "destination": "LHR", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "20:30"},
+    {"flight_number": "AA200", "route_id": "ORD-CDG", "origin": "ORD", "destination": "CDG", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "21:00"},
+    {"flight_number": "LH400", "route_id": "ORD-FRA", "origin": "ORD", "destination": "FRA", "airline_code": "LH", "airline_name": "Lufthansa",          "departure_time": "21:30"},
+    {"flight_number": "UA601", "route_id": "ORD-NRT", "origin": "ORD", "destination": "NRT", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "22:00"},
+    {"flight_number": "AA201", "route_id": "ORD-GRU", "origin": "ORD", "destination": "GRU", "airline_code": "AA", "airline_name": "American Airlines",  "departure_time": "22:30"},
+    {"flight_number": "UA602", "route_id": "ORD-PVG", "origin": "ORD", "destination": "PVG", "airline_code": "UA", "airline_name": "United Airlines",    "departure_time": "23:00"},
+    {"flight_number": "DL300", "route_id": "ORD-AMS", "origin": "ORD", "destination": "AMS", "airline_code": "DL", "airline_name": "Delta Air Lines",    "departure_time": "23:30"},
+]
+
+# ─────────────────────────────────────────
+# PRICE SIMULATION
+# ─────────────────────────────────────────
+
+SHORT_HAUL  = ["STL", "DFW", "ATL", "PHX", "LGA", "BOS", "IND", "MKE"]
+MEDIUM_HAUL = ["LAX", "SFO", "SEA", "DEN", "MIA", "JFK"]
+INTL        = ["LHR", "CDG", "FRA", "NRT", "PVG", "AMS", "GRU"]
+
+def simulate_price(destination):
+    if destination in SHORT_HAUL:
+        base = random.randint(80, 150)
+    elif destination in MEDIUM_HAUL:
+        base = random.randint(150, 250)
+    elif destination in INTL:
+        base = random.randint(600, 1000)
+    else:
+        base = random.randint(150, 300)
+
+    variance    = random.uniform(0.80, 1.20)
+    hour        = datetime.now(timezone.utc).hour
     time_factor = 1.10 if hour in [7, 8, 9, 17, 18, 19] else 1.0
-    price = round(base * variance * time_factor, 2)
-    return price
+    return round(base * variance * time_factor, 2)
 
-def serialize_avro(record, schema):
-    """Serialize a record to Avro bytes."""
-    parsed_schema = fastavro.parse_schema(schema)
-    buffer = io.BytesIO()
-    fastavro.schemaless_writer(buffer, parsed_schema, record)
-    return buffer.getvalue()
+# ─────────────────────────────────────────
+# DEPARTURE CHECK
+# Departure times stored in CT, compare against UTC
+# ─────────────────────────────────────────
 
-def publish_message(publisher, topic_path, record):
-    """Publish a single Avro message to Pub/Sub."""
-    # Since we set message-encoding=JSON on the topic,
-    # publish as JSON bytes not binary Avro
-    data = json.dumps(record).encode("utf-8")
-    future = publisher.publish(topic_path, data)
-    return future.result()
+CT = pytz.timezone("America/Chicago")
+
+def is_active(flight):
+    today_ct      = datetime.now(CT).strftime("%Y-%m-%d")
+    departure_str = f"{today_ct} {flight['departure_time']}"
+    departure_ct  = CT.localize(datetime.strptime(departure_str, "%Y-%m-%d %H:%M"))
+    departure_utc = departure_ct.astimezone(timezone.utc)
+    return datetime.now(timezone.utc) < departure_utc
+
+# ─────────────────────────────────────────
+# PUBLISH TO PUB/SUB
+# ─────────────────────────────────────────
 
 def run(request=None):
-    """Main entry point for Cloud Function."""
-    now = datetime.now(timezone.utc)
-    ingestion_ts = int(now.timestamp())
-
-    # Step 1: Read active routes from GCS
-    routes = read_active_routes()
-
-    # Step 2: Set up Pub/Sub publisher
-    publisher = pubsub_v1.PublisherClient()
+    publisher  = pubsub_v1.PublisherClient()
     topic_path = publisher.topic_path(PROJECT_ID, TOPIC_ID)
 
-    # Step 3: For each route, generate price and publish
-    published = 0
-    for route in routes:
-        record = {
-            "route_id":            route["route_id"],
-            "origin":              route["origin"],
-            "destination":         route["destination"],
-            "airline_code":        route["airline_code"],
-            "airline_name":        route["airline_name"],
-            "flight_number":       route["flight_number"],
-            "price_usd":           simulate_price(route["route_id"]),
-            "flight_date":         route["flight_date"],
-            "scheduled_departure": route["scheduled_departure"],
-            "event_timestamp":     ingestion_ts,
-            "ingestion_timestamp": ingestion_ts
+    today     = datetime.now(CT).strftime("%Y-%m-%d")
+    futures   = []
+    skipped   = 0
+
+    for flight in FLIGHTS:
+        # Skip departed flights
+        if not is_active(flight):
+            skipped += 1
+            continue
+
+        now     = int(time.time())
+        message = {
+            "route_id":            flight["route_id"],
+            "origin":              flight["origin"],
+            "destination":         flight["destination"],
+            "airline_code":        flight["airline_code"],
+            "airline_name":        flight["airline_name"],
+            "flight_number":       flight["flight_number"],
+            "price_usd":           simulate_price(flight["destination"]),
+            "flight_date":         today,
+            "scheduled_departure": f"{today}T{flight['departure_time']}:00",
+            "event_timestamp":     now,
+            "ingestion_timestamp": now
         }
 
-        publish_message(publisher, topic_path, record)
-        print(f"Published: {record['route_id']} @ ${record['price_usd']}")
-        published += 1
+        data   = json.dumps(message).encode("utf-8")
+        future = publisher.publish(topic_path, data)
+        futures.append((future, flight["flight_number"]))
 
-    print(f"Function B complete. Published {published} messages.")
+    # Wait for all acks
+    published = 0
+    failed    = 0
+
+    for future, flight_number in futures:
+        try:
+            future.result()
+            published += 1
+        except Exception as e:
+            print(f"Failed to publish {flight_number}: {e}")
+            failed += 1
+
+    print(f"Published: {published} | Skipped (departed): {skipped} | Failed: {failed}")
     return f"Published {published} messages.", 200
+
 
 if __name__ == "__main__":
     run()
