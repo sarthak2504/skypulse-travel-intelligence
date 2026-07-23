@@ -122,7 +122,18 @@ def run(request=None):
             skipped += 1
             continue
 
-        now     = int(time.time())
+        now = int(time.time())
+
+        # 5% chance of simulating a late message
+        # Backdates event_timestamp by 3-5 minutes
+        # ingestion_timestamp stays as now
+        # lateness = now - event_ts > 120s → routes to late_arrivals in Dataflow
+        if random.random() < 0.05:
+            delay_seconds = random.randint(180, 300)
+            event_ts = now - delay_seconds
+        else:
+            event_ts = now
+
         message = {
             "route_id":            flight["route_id"],
             "origin":              flight["origin"],
@@ -133,7 +144,7 @@ def run(request=None):
             "price_usd":           simulate_price(flight["destination"]),
             "flight_date":         today,
             "scheduled_departure": f"{today}T{flight['departure_time']}:00",
-            "event_timestamp":     now,
+            "event_timestamp":     event_ts,
             "ingestion_timestamp": now
         }
 

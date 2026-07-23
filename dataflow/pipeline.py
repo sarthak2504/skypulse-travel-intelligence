@@ -6,13 +6,14 @@ from apache_beam.options.pipeline_options import PipelineOptions, StandardOption
 from apache_beam.transforms.window import FixedWindows, SlidingWindows
 from apache_beam.transforms.trigger import AfterWatermark, AfterCount, AccumulationMode
 from apache_beam.utils.timestamp import Duration
+from apache_beam.options.pipeline_options import PipelineOptions, StandardOptions, GoogleCloudOptions, SetupOptions, WorkerOptions
 from datetime import datetime, timezone
 
 # ─────────────────────────────────────────
 # CONFIGURATION
 # ─────────────────────────────────────────
 PROJECT_ID = "triptide-28062026"
-REGION = "us-central1"
+REGION = "us-east1"
 SUBSCRIPTION = "projects/triptide-28062026/subscriptions/flight-prices-sub"
 BUCKET = "gs://skypulse-triptide"
 
@@ -37,6 +38,7 @@ LATE_TAG = "late"
 SCHEMA_5MIN = {
     "fields": [
         {"name": "route_id",              "type": "STRING"},
+        {"name": "flight_number",         "type": "STRING"},
         {"name": "origin",                "type": "STRING"},
         {"name": "destination",           "type": "STRING"},
         {"name": "airline_code",          "type": "STRING"},
@@ -54,6 +56,7 @@ SCHEMA_5MIN = {
 SCHEMA_1HR = {
     "fields": [
         {"name": "route_id",              "type": "STRING"},
+        {"name": "flight_number",         "type": "STRING"},
         {"name": "origin",                "type": "STRING"},
         {"name": "destination",           "type": "STRING"},
         {"name": "airline_code",          "type": "STRING"},
@@ -68,6 +71,7 @@ SCHEMA_1HR = {
 SCHEMA_LATE = {
     "fields": [
         {"name": "route_id",              "type": "STRING"},
+        {"name": "flight_number",         "type": "STRING"},
         {"name": "origin",                "type": "STRING"},
         {"name": "destination",           "type": "STRING"},
         {"name": "airline_code",          "type": "STRING"},
@@ -147,6 +151,7 @@ class SplitLateMessages(beam.DoFn):
             # Route to late side output
             late_record = {
                 "route_id":             element["route_id"],
+                "flight_number":        element.get("flight_number", ""),
                 "origin":               element["origin"],
                 "destination":          element["destination"],
                 "airline_code":         element["airline_code"],
@@ -200,6 +205,7 @@ class AggregatePrice(beam.DoFn):
 
         yield {
             "route_id":             route_id,
+            "flight_number":        first.get("flight_number", ""),
             "origin":               first.get("origin", ""),
             "destination":          first.get("destination", ""),
             "airline_code":         first.get("airline_code", ""),
@@ -240,6 +246,7 @@ class AggregatePriceTrend(beam.DoFn):
 
         yield {
             "route_id":             route_id,
+            "flight_number":        first.get("flight_number", ""),
             "origin":               first.get("origin", ""),
             "destination":          first.get("destination", ""),
             "airline_code":         first.get("airline_code", ""),
@@ -269,7 +276,10 @@ def run():
     gcp_options.region = REGION
     gcp_options.staging_location = f"{BUCKET}/dataflow/staging"
     gcp_options.temp_location = f"{BUCKET}/dataflow/temp"
-    gcp_options.job_name = "skypulse-price-pipeline"
+    gcp_options.job_name = "skypulse-price-pipeline-east"
+
+    worker_options = options.view_as(WorkerOptions)
+    worker_options.zone = "us-east1-b"
 
     # Setup options
     setup_options = options.view_as(SetupOptions)
