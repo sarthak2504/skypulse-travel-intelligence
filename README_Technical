@@ -1,0 +1,294 @@
+# SkyPulse — Technical Reference
+
+---
+
+## Architecture
+
+```
+AviationStack API (real flight routes, ORD departures)
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│                  INGESTION LAYER          ✅ Done    │
+│                                                      │
+│  Cloud Function A (daily)                            │
+│  └── Fetches real ORD flight schedules               │
+│  └── Extracts operating carriers from codeshares     │
+│  └── Saves full dataset → GCS Bronze                 │
+│                                                      │
+│  Cloud Function B (every 60 seconds)                 │
+│  └── Hardcoded 36-flight ORD schedule                │
+│  └── is_active() check — skips departed flights      │
+│  └── Simulates price per flight (distance-based)     │
+│  └── 5% late message simulation                      │
+│  └── Publishes Avro message → Pub/Sub                │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│               MESSAGE QUEUE LAYER         ✅ Done    │
+│                                                      │
+│  Pub/Sub topic: flight-prices-raw                    │
+│  └── Avro schema enforced at publish time            │
+│  └── Dead letter topic: flight-prices-dlq            │
+│  └── 7-day message retention                         │
+│  └── 5 max delivery attempts before DLQ              │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│             STREAM PROCESSING LAYER       ✅ Done    │
+│                                                      │
+│  Dataflow (Apache Beam 2.74.0)                       │
+│  └── Fixed window (5 min): avg price per flight      │
+│  └── Sliding window (1hr/15min): trend baseline      │
+│  └── Event time windowing (not processing time)      │
+│  └── Watermark: 2-min allowed lateness               │
+│  └── Late data side output → late_arrivals           │
+│  └── Exactly-once via Streaming Engine               │
+│  └── Writes to BigQuery Silver                       │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│                 STORAGE LAYER             ✅ Done    │
+│                                                      │
+│  GCS Bronze → Nearline 30d → Coldline 90d            │
+│  BigQuery Silver:                                    │
+│  └── price_5min_avg (append, may have duplicates)    │
+│  └── price_1hr_trend (append, may have duplicates)   │
+│  └── late_arrivals                                   │
+│  BigQuery Gold (star schema, always clean):          │
+│  └── fact_flight_prices                              │
+│  └── dim_flights (SCD Type 2)                        │
+│  └── dim_airlines                                    │
+│  └── dim_date                                        │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│              BATCH PROCESSING LAYER       ✅ Done    │
+│                                                      │
+│  Dataproc Serverless (PySpark)                       │
+│  └── Watermark-based incremental reads               │
+│  └── Deduplication (ROW_NUMBER window function)      │
+│  └── dim_date, dim_airlines, dim_flights population  │
+│  └── SCD Type 2 change detection                     │
+│  └── Anomaly detection (3-sigma z-score)             │
+│  └── fact_flight_prices population                   │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│              ORCHESTRATION + DQ        🔜 Week 4     │
+│                                                      │
+│  Cloud Composer (managed Airflow)                    │
+│  └── Daily DAG triggering Spark job                  │
+│  └── Rule-based DQ (row counts, nulls, freshness)    │
+│  └── Statistical anomaly alerts                      │
+│  └── Late arrivals reconciliation                    │
+│  └── Cloud Monitoring alerts                         │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│            INFRASTRUCTURE AS CODE      🔜 Week 5     │
+│                                                      │
+│  Terraform                                           │
+│  └── All GCP resources as code                       │
+│  └── Secret Manager for API keys                     │
+│  └── Reproducible dev + prod environments            │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│               ANALYTICS SERVING        🔜 Weeks 6-7  │
+│                                                      │
+│  Snowflake                                           │
+│  └── Snowpipe: continuous ingestion from GCS         │
+│  └── Snowpark: Python transformations                │
+│  └── Dynamic Tables: materialized hourly summary     │
+│  └── Cortex Analyst: natural language queries        │
+└─────────────────────────────────────────────────────┘
+        │
+        ▼
+┌─────────────────────────────────────────────────────┐
+│                    AI LAYER            🔜 Weeks 8-9  │
+│                                                      │
+│  Claude API + pgvector RAG                           │
+│  └── Route embeddings in Cloud SQL PostgreSQL        │
+│  └── Semantic search over routes                     │
+│  └── Multi-step agent (search + BQ + Snowflake)      │
+│  └── Streamlit UI on Cloud Run                       │
+└─────────────────────────────────────────────────────┘
+```
+
+---
+
+## Data Model
+
+### Silver Layer (BigQuery)
+
+**price_5min_avg** — 5-minute windowed average price per flight
+```
+flight_number, route_id, origin, destination, airline_code, airline_name,
+window_start, window_end, avg_price_usd, min_price_usd, max_price_usd,
+message_count, processing_timestamp
+```
+
+**price_1hr_trend** — 1-hour sliding window average per flight
+```
+flight_number, route_id, origin, destination, airline_code,
+window_start, window_end, avg_price_usd, message_count, processing_timestamp
+```
+
+**late_arrivals** — messages arriving >2 minutes after event time
+```
+route_id, flight_number, origin, destination, airline_code, price_usd,
+flight_date, event_timestamp, ingestion_timestamp, lateness_seconds,
+processing_timestamp
+```
+
+### Gold Layer (BigQuery)
+
+**Grain:** One row in `fact_flight_prices` = one flight × one 5-minute window
+
+**fact_flight_prices**
+```
+flight_key (FK), airline_key (FK), date_key (FK),
+window_start, window_end,
+avg_price_usd, min_price_usd, max_price_usd, message_count,
+is_anomaly, z_score, created_at
+```
+
+**dim_flights (SCD Type 2)**
+```
+flight_key (surrogate), flight_number (natural),
+route_id, origin, destination, airline_code,
+effective_date, expiry_date, is_current
+```
+
+**dim_airlines**
+```
+airline_key, airline_code, airline_name, alliance, is_domestic
+```
+
+**dim_date**
+```
+date_key, date, day_of_week, day_number,
+is_weekend, month, quarter, is_us_holiday, season
+```
+
+---
+
+## Architectural Decisions
+
+### Why Pub/Sub over Kafka?
+Pub/Sub is fully managed, integrates natively with Dataflow, and replay is handled at GCS layer. Kafka would be chosen for message-level replay, strict ordering, or existing Kafka investment.
+
+### Why fixed AND sliding windows?
+Fixed windows answer "what is the price now?" (5-minute snapshot). Sliding windows answer "what is the typical price?" (1-hour rolling baseline). Both are needed for anomaly detection — you compare the 5-minute spike against the 1-hour mean.
+
+### Why event time over processing time?
+Event time ensures every price tick is assigned to the window when the price actually occurred, not when Dataflow received it. Processing time windowing would silently assign late messages to wrong windows.
+
+### Why BigQuery Silver has duplicates?
+BigQuery streaming inserts are append-only. Dataflow's accumulating mode fires a window result twice — once at watermark, again for late data. Deduplication happens in the Spark batch job using ROW_NUMBER().
+
+### Why two layers (Silver + Gold)?
+Silver is raw and immutable — append-only, full history, used for reprocessing. Gold is clean and analytical — deduplicated, dimensional, optimized for queries. Separation follows the principle that raw data should never be modified.
+
+### Why SCD Type 2 for dim_flights?
+Flight attributes change occasionally (airline codeshare changes, route modifications). SCD Type 2 preserves history so historical price facts always join to the correct flight attributes for their time period.
+
+### Why Dataproc Serverless over a managed cluster?
+The batch job runs once daily and completes in 2-3 minutes. Dataproc Serverless charges only for job execution time — no idle cluster cost. A managed cluster would charge even when the job isn't running.
+
+---
+
+## Anomaly Detection
+
+Z-score based detection comparing 5-minute window prices against the 7-day rolling baseline.
+
+```
+z_score = |avg_price_5min - rolling_mean_1hr| / rolling_stddev_1hr
+is_anomaly = z_score > 3.0
+```
+
+**Interpretation:**
+- z < 1: price within normal daily variation
+- 1 < z < 3: slightly elevated, monitor
+- z > 3: genuine anomaly — flash sale, demand spike, data quality issue
+
+**Known limitation:** z-scores are inflated in the first 7 days because standard deviation is computed from too few historical data points. This resolves naturally as data accumulates.
+
+---
+
+## Cost Summary
+
+| Service | Cost |
+|---|---|
+| Cloud Functions (A+B) | ~$0 (free tier) |
+| Cloud Scheduler | ~$0 (free tier) |
+| Pub/Sub | ~$0 (free tier, <100MB/month) |
+| GCS | ~$0 (free tier) |
+| Dataflow (streaming) | ~$0.10/hr when running |
+| Dataproc Serverless | ~$0.10-0.20 per daily job |
+| BigQuery | ~$0 (free tier, <1TB queries/month) |
+| **Total (ongoing)** | **~$2-3/day when Dataflow running** |
+
+All costs covered by GCP $300 free trial credits.
+
+---
+
+## Setup
+
+### Prerequisites
+- GCP account with billing enabled
+- `gcloud` CLI installed and authenticated
+- Python 3.11+
+- AviationStack free API key
+
+### Deploy
+
+```bash
+git clone https://github.com/sarthak2504/skypulse-travel-intelligence.git
+cd skypulse-travel-intelligence
+
+gcloud auth login
+gcloud config set project YOUR_PROJECT_ID
+
+# Enable APIs
+gcloud services enable pubsub.googleapis.com storage.googleapis.com \
+  cloudfunctions.googleapis.com cloudscheduler.googleapis.com \
+  iam.googleapis.com cloudbuild.googleapis.com run.googleapis.com \
+  dataflow.googleapis.com bigquery.googleapis.com dataproc.googleapis.com
+
+# Deploy Function B (price ticker)
+cd functions/function_b
+pip install -r requirements.txt
+gcloud functions deploy function-b-price-ticker --gen2 --runtime=python311 \
+  --region=us-east1 --source=. --entry-point=run --trigger-http \
+  --memory=256MB --timeout=60s
+
+# Deploy Dataflow pipeline
+cd ../../dataflow
+python -m venv venv --system-site-packages
+venv/Scripts/activate  # Windows
+pip install apache-beam[gcp]==2.74.0
+python pipeline.py
+
+# Run Spark batch job
+gsutil cp spark/batch_job.py gs://YOUR_BUCKET/spark/batch_job.py
+gcloud dataproc batches submit pyspark gs://YOUR_BUCKET/spark/batch_job.py \
+  --region=us-central1 --deps-bucket=gs://YOUR_BUCKET
+```
+
+Full setup documented in `commands.md`.
+
+---
+
+## Author
+
+**Sarthak Bhingarde**
+[LinkedIn](https://linkedin.com/in/sarthakbhingarde) | [GitHub](https://github.com/sarthak2504)
