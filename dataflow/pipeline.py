@@ -279,7 +279,7 @@ def run():
     gcp_options.job_name = "skypulse-price-pipeline-east"
 
     worker_options = options.view_as(WorkerOptions)
-    worker_options.zone = "us-east1-b"
+    worker_options.zone = "us-east1-c"
 
     # Setup options
     setup_options = options.view_as(SetupOptions)

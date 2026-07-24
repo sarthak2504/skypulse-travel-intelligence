@@ -19,7 +19,7 @@ AviationStack API (real flight routes, ORD departures)
 │  Cloud Function B (every 60 seconds)                 │
 │  └── Hardcoded 36-flight ORD schedule                │
 │  └── is_active() check — skips departed flights      │
-│  └── Simulates price per flight (distance-based)     │
+│  └── Distance-based price simulation (±20% variance) │
 │  └── 5% late message simulation                      │
 │  └── Publishes Avro message → Pub/Sub                │
 └─────────────────────────────────────────────────────┘
@@ -40,9 +40,9 @@ AviationStack API (real flight routes, ORD departures)
 │             STREAM PROCESSING LAYER       ✅ Done    │
 │                                                      │
 │  Dataflow (Apache Beam 2.74.0)                       │
+│  └── Event time windowing (not processing time)      │
 │  └── Fixed window (5 min): avg price per flight      │
 │  └── Sliding window (1hr/15min): trend baseline      │
-│  └── Event time windowing (not processing time)      │
 │  └── Watermark: 2-min allowed lateness               │
 │  └── Late data side output → late_arrivals           │
 │  └── Exactly-once via Streaming Engine               │
@@ -54,15 +54,15 @@ AviationStack API (real flight routes, ORD departures)
 │                 STORAGE LAYER             ✅ Done    │
 │                                                      │
 │  GCS Bronze → Nearline 30d → Coldline 90d            │
-│  BigQuery Silver:                                    │
-│  └── price_5min_avg (append, may have duplicates)    │
-│  └── price_1hr_trend (append, may have duplicates)   │
+│  BigQuery Silver (append-only, may have duplicates): │
+│  └── price_5min_avg                                  │
+│  └── price_1hr_trend                                 │
 │  └── late_arrivals                                   │
-│  BigQuery Gold (star schema, always clean):          │
-│  └── fact_flight_prices                              │
-│  └── dim_flights (SCD Type 2)                        │
-│  └── dim_airlines                                    │
-│  └── dim_date                                        │
+│  BigQuery Gold (clean star schema):                  │
+│  └── fact_flight_prices (11,191+ rows)               │
+│  └── dim_flights (SCD Type 2, 36 rows)               │
+│  └── dim_airlines (5 rows)                           │
+│  └── dim_date (3 rows)                               │
 └─────────────────────────────────────────────────────┘
         │
         ▼
@@ -73,21 +73,31 @@ AviationStack API (real flight routes, ORD departures)
 │  └── Watermark-based incremental reads               │
 │  └── Deduplication (ROW_NUMBER window function)      │
 │  └── dim_date, dim_airlines, dim_flights population  │
-│  └── SCD Type 2 change detection                     │
+│  └── SCD Type 2 change detection on dim_flights      │
 │  └── Anomaly detection (3-sigma z-score)             │
 │  └── fact_flight_prices population                   │
 └─────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────┐
-│              ORCHESTRATION + DQ        🔜 Week 4     │
+│              ORCHESTRATION + DQ           ✅ Done    │
 │                                                      │
 │  Cloud Composer (managed Airflow)                    │
-│  └── Daily DAG triggering Spark job                  │
-│  └── Rule-based DQ (row counts, nulls, freshness)    │
-│  └── Statistical anomaly alerts                      │
-│  └── Late arrivals reconciliation                    │
-│  └── Cloud Monitoring alerts                         │
+│  Daily DAG — 8 tasks:                                │
+│  └── check_silver_freshness (data within 2hrs)       │
+│  └── check_silver_row_counts (min 100 rows/day)      │
+│  └── check_null_rates (critical fields <1% null)     │
+│  └── run_spark_batch_job (Dataproc Serverless)       │
+│  └── check_gold_freshness (Gold received new rows)   │
+│  └── check_late_arrivals_volume (alert if >10%)      │
+│  └── reconcile_late_arrivals (reprocess if needed)   │
+│  └── write_audit_log (pipeline run summary)          │
+│                                                      │
+│  First run results:                                  │
+│  └── 21,641 Silver rows processed                    │
+│  └── 11,191 Gold rows written                        │
+│  └── 4,131 late arrivals reconciled                  │
+│  └── Status: SUCCESS                                 │
 └─────────────────────────────────────────────────────┘
         │
         ▼
@@ -135,6 +145,7 @@ flight_number, route_id, origin, destination, airline_code, airline_name,
 window_start, window_end, avg_price_usd, min_price_usd, max_price_usd,
 message_count, processing_timestamp
 ```
+Note: May contain duplicates from accumulating mode. Deduplication happens in Spark.
 
 **price_1hr_trend** — 1-hour sliding window average per flight
 ```
@@ -147,6 +158,17 @@ window_start, window_end, avg_price_usd, message_count, processing_timestamp
 route_id, flight_number, origin, destination, airline_code, price_usd,
 flight_date, event_timestamp, ingestion_timestamp, lateness_seconds,
 processing_timestamp
+```
+
+**pipeline_watermarks** — tracks last processed timestamp per pipeline
+```
+pipeline_name, last_processed_ts, updated_at
+```
+
+**pipeline_audit_log** — daily pipeline run summary
+```
+run_date, run_timestamp, silver_rows, gold_rows,
+late_arrivals, late_rate, reconciled_count, status
 ```
 
 ### Gold Layer (BigQuery)
@@ -181,34 +203,63 @@ is_weekend, month, quarter, is_us_holiday, season
 
 ---
 
+## Airflow DAG Structure
+
+```
+check_silver_freshness
+        ↓
+check_silver_row_counts
+        ↓
+check_null_rates
+        ↓
+run_spark_batch_job (DataprocCreateBatchOperator)
+        ↓
+check_gold_freshness
+        ↓
+check_late_arrivals_volume (BranchPythonOperator)
+        ↙                    ↘
+reconcile_late_arrivals    write_audit_log
+        ↓
+write_audit_log
+```
+
+**Branch logic:** `check_late_arrivals_volume` checks if late arrival rate exceeds 10%. If yes → runs `reconcile_late_arrivals` before `write_audit_log`. If no → skips directly to `write_audit_log`.
+
+**Trigger rule on audit log:** `none_failed_min_one_success` — audit log runs regardless of which branch was taken.
+
+---
+
 ## Architectural Decisions
-
-### Why Pub/Sub over Kafka?
-Pub/Sub is fully managed, integrates natively with Dataflow, and replay is handled at GCS layer. Kafka would be chosen for message-level replay, strict ordering, or existing Kafka investment.
-
-### Why fixed AND sliding windows?
-Fixed windows answer "what is the price now?" (5-minute snapshot). Sliding windows answer "what is the typical price?" (1-hour rolling baseline). Both are needed for anomaly detection — you compare the 5-minute spike against the 1-hour mean.
 
 ### Why event time over processing time?
 Event time ensures every price tick is assigned to the window when the price actually occurred, not when Dataflow received it. Processing time windowing would silently assign late messages to wrong windows.
 
+### Why fixed AND sliding windows?
+Fixed windows (5-min) answer "what is the price right now?" — volatile, one row per flight per 5-min interval. Sliding windows (1-hr/15-min) answer "what is the typical price?" — smooth rolling baseline. Both are needed for anomaly detection.
+
 ### Why BigQuery Silver has duplicates?
-BigQuery streaming inserts are append-only. Dataflow's accumulating mode fires a window result twice — once at watermark, again for late data. Deduplication happens in the Spark batch job using ROW_NUMBER().
+BigQuery streaming inserts are append-only. Dataflow's accumulating mode fires a window result twice — once at watermark, again if late data arrives. Deduplication happens in the Spark batch job using ROW_NUMBER() window function.
 
 ### Why two layers (Silver + Gold)?
-Silver is raw and immutable — append-only, full history, used for reprocessing. Gold is clean and analytical — deduplicated, dimensional, optimized for queries. Separation follows the principle that raw data should never be modified.
+Silver is raw and immutable — full history, used for reprocessing and audit. Gold is clean and analytical — deduplicated, dimensional, optimized for queries. Separation follows the principle that raw data should never be modified.
 
 ### Why SCD Type 2 for dim_flights?
-Flight attributes change occasionally (airline codeshare changes, route modifications). SCD Type 2 preserves history so historical price facts always join to the correct flight attributes for their time period.
+Flight attributes change occasionally. SCD Type 2 preserves history so historical price facts always join to the correct flight attributes for their time period.
 
 ### Why Dataproc Serverless over a managed cluster?
-The batch job runs once daily and completes in 2-3 minutes. Dataproc Serverless charges only for job execution time — no idle cluster cost. A managed cluster would charge even when the job isn't running.
+Batch job runs once daily, completes in 2-3 minutes. Serverless charges only for execution time — no idle cluster cost.
+
+### Why Cloud Composer for orchestration?
+Airflow provides dependency management, retry logic, branching (late arrival reconciliation only when threshold exceeded), XCom for passing data between tasks, and a visual DAG graph. More robust than cron + shell scripts.
+
+### Why Pub/Sub over Kafka?
+Fully managed, native Dataflow integration, replay handled at GCS layer. Kafka for message-level replay or strict ordering requirements.
 
 ---
 
 ## Anomaly Detection
 
-Z-score based detection comparing 5-minute window prices against the 7-day rolling baseline.
+Z-score based detection comparing 5-minute window prices against 7-day rolling baseline.
 
 ```
 z_score = |avg_price_5min - rolling_mean_1hr| / rolling_stddev_1hr
@@ -216,28 +267,70 @@ is_anomaly = z_score > 3.0
 ```
 
 **Interpretation:**
-- z < 1: price within normal daily variation
+- z < 1: within normal daily variation
 - 1 < z < 3: slightly elevated, monitor
-- z > 3: genuine anomaly — flash sale, demand spike, data quality issue
+- z > 3: genuine anomaly — flash sale, demand spike, or data quality issue
 
-**Known limitation:** z-scores are inflated in the first 7 days because standard deviation is computed from too few historical data points. This resolves naturally as data accumulates.
+**Note:** z-scores are inflated in the first 7 days because stddev is computed from too few data points. Resolves naturally as data accumulates.
+
+---
+
+## IAM Roles Required
+
+| Service Account | Role | Purpose |
+|---|---|---|
+| skypulse-ingestion-sa | roles/pubsub.publisher | Publish to Pub/Sub topics |
+| skypulse-ingestion-sa | roles/storage.objectAdmin | Read/write GCS objects |
+| skypulse-ingestion-sa | roles/cloudfunctions.invoker | Trigger Cloud Functions |
+| skypulse-ingestion-sa | roles/dataflow.worker | Run as Dataflow worker |
+| skypulse-ingestion-sa | roles/bigquery.dataEditor | Write to BigQuery tables |
+| skypulse-ingestion-sa | roles/bigquery.jobUser | Run BigQuery jobs |
+| skypulse-ingestion-sa | roles/dataproc.worker | Run Dataproc Serverless jobs |
+| skypulse-ingestion-sa | roles/bigquery.readSessionUser | Read BigQuery via Storage API |
+| service-47109282086@cloudcomposer-accounts | roles/composer.ServiceAgentV2Ext | Composer internal operations |
+| service-47109282086@gcp-sa-pubsub | roles/pubsub.publisher (on DLQ topic) | Forward failed messages to DLQ |
+| service-47109282086@gcp-sa-pubsub | roles/pubsub.subscriber (on main sub) | Read messages for DLQ forwarding |
+
+---
+
+## APIs Enabled
+
+```
+pubsub.googleapis.com
+storage.googleapis.com
+cloudfunctions.googleapis.com
+cloudscheduler.googleapis.com
+iam.googleapis.com
+cloudbuild.googleapis.com
+run.googleapis.com
+dataflow.googleapis.com
+bigquery.googleapis.com
+bigquerystorage.googleapis.com
+dataproc.googleapis.com
+composer.googleapis.com
+container.googleapis.com
+```
 
 ---
 
 ## Cost Summary
 
-| Service | Cost |
-|---|---|
-| Cloud Functions (A+B) | ~$0 (free tier) |
-| Cloud Scheduler | ~$0 (free tier) |
-| Pub/Sub | ~$0 (free tier, <100MB/month) |
-| GCS | ~$0 (free tier) |
-| Dataflow (streaming) | ~$0.10/hr when running |
-| Dataproc Serverless | ~$0.10-0.20 per daily job |
-| BigQuery | ~$0 (free tier, <1TB queries/month) |
-| **Total (ongoing)** | **~$2-3/day when Dataflow running** |
+| Service | When running | Est. daily cost |
+|---|---|---|
+| Cloud Functions A+B | Always (scheduled) | ~$0 (free tier) |
+| Cloud Scheduler | Always | ~$0 (free tier) |
+| Pub/Sub | Always | ~$0 (free tier) |
+| GCS | Always | ~$0 (free tier) |
+| Dataflow | When streaming | ~$2.40/day |
+| Dataproc Serverless | 2-3 min/day | ~$0.15/day |
+| BigQuery | Query time | ~$0 (free tier) |
+| Cloud Composer | When environment exists | ~$6/day |
+| **Total (Dataflow + Composer)** | | **~$8.50/day** |
+| **Total (Dataflow only)** | | **~$2.55/day** |
 
-All costs covered by GCP $300 free trial credits.
+All covered by GCP $300 free trial credits.
+
+**Cost tip:** Delete Composer after testing each week. Recreate only when deploying/testing DAG changes. Dataflow can run continuously during active development weeks.
 
 ---
 
@@ -246,8 +339,8 @@ All costs covered by GCP $300 free trial credits.
 ### Prerequisites
 - GCP account with billing enabled
 - `gcloud` CLI installed and authenticated
-- Python 3.11+
-- AviationStack free API key
+- Python 3.11+ (Beam 2.74.0 requires Python 3.11-3.13)
+- AviationStack free API key (aviationstack.com)
 
 ### Deploy
 
@@ -258,30 +351,36 @@ cd skypulse-travel-intelligence
 gcloud auth login
 gcloud config set project YOUR_PROJECT_ID
 
-# Enable APIs
+# Enable all APIs
 gcloud services enable pubsub.googleapis.com storage.googleapis.com \
   cloudfunctions.googleapis.com cloudscheduler.googleapis.com \
   iam.googleapis.com cloudbuild.googleapis.com run.googleapis.com \
-  dataflow.googleapis.com bigquery.googleapis.com dataproc.googleapis.com
+  dataflow.googleapis.com bigquery.googleapis.com \
+  bigquerystorage.googleapis.com dataproc.googleapis.com \
+  composer.googleapis.com container.googleapis.com
 
-# Deploy Function B (price ticker)
+# Deploy Function B
 cd functions/function_b
-pip install -r requirements.txt
 gcloud functions deploy function-b-price-ticker --gen2 --runtime=python311 \
-  --region=us-east1 --source=. --entry-point=run --trigger-http \
+  --region=us-central1 --source=. --entry-point=run --trigger-http \
   --memory=256MB --timeout=60s
 
 # Deploy Dataflow pipeline
 cd ../../dataflow
 python -m venv venv --system-site-packages
-venv/Scripts/activate  # Windows
+venv\Scripts\activate
 pip install apache-beam[gcp]==2.74.0
 python pipeline.py
 
 # Run Spark batch job
 gsutil cp spark/batch_job.py gs://YOUR_BUCKET/spark/batch_job.py
 gcloud dataproc batches submit pyspark gs://YOUR_BUCKET/spark/batch_job.py \
-  --region=us-central1 --deps-bucket=gs://YOUR_BUCKET
+  --region=us-east1 --deps-bucket=gs://YOUR_BUCKET
+
+# Deploy Airflow DAG
+gcloud composer environments storage dags import \
+  --environment=skypulse-composer --location=us-central1 \
+  --source=dags/skypulse_daily_dag.py
 ```
 
 Full setup documented in `commands.md`.

@@ -479,3 +479,116 @@ gcloud dataflow jobs cancel JOB_ID --region=us-east1 --project=triptide-28062026
 | High z-scores (100+) | Only 2 unique 1hr windows, stddev near zero | Add deduplication to read_silver_1hr(); resolves naturally after 7 days of data |
 | price_5min_avg has duplicates | Dataflow accumulating mode fires window twice | Expected — Spark deduplication handles in Gold layer |
 | AviationStack returns yesterday's flights | No flight_date filter, returns "scheduled" flights already departed | Add flight_date param; or use hardcoded schedule |
+
+---
+
+## Cloud Composer (Managed Airflow)
+
+```bash
+# Grant required role for Composer Service Agent
+gcloud projects add-iam-policy-binding triptide-28062026 \
+  --member="serviceAccount:service-47109282086@cloudcomposer-accounts.iam.gserviceaccount.com" \
+  --role="roles/composer.ServiceAgentV2Ext"
+
+# Enable required APIs for Composer
+gcloud services enable composer.googleapis.com container.googleapis.com \
+  --project=triptide-28062026
+
+# Create Composer environment (takes 15-20 minutes)
+# environment-size=small keeps cost low (~$0.25/hr)
+gcloud composer environments create skypulse-composer \
+  --location=us-central1 \
+  --image-version=composer-2.9.7-airflow-2.9.3 \
+  --environment-size=small \
+  --service-account=47109282086-compute@developer.gserviceaccount.com \
+  --project=triptide-28062026
+
+# Check environment state
+gcloud composer environments describe skypulse-composer \
+  --location=us-central1 \
+  --project=triptide-28062026 \
+  --format="value(state)"
+
+# Get Airflow UI URL
+gcloud composer environments describe skypulse-composer \
+  --location=us-central1 \
+  --project=triptide-28062026 \
+  --format="value(config.airflowUri)"
+
+# Deploy DAG file to Composer
+gcloud composer environments storage dags import \
+  --environment=skypulse-composer \
+  --location=us-central1 \
+  --source=dags/skypulse_daily_dag.py \
+  --project=triptide-28062026
+
+# Trigger DAG manually via CLI
+gcloud composer environments run skypulse-composer \
+  --location=us-central1 \
+  --project=triptide-28062026 \
+  dags trigger -- skypulse_daily_pipeline
+
+# Pause DAG
+gcloud composer environments run skypulse-composer \
+  --location=us-central1 \
+  --project=triptide-28062026 \
+  dags pause -- skypulse_daily_pipeline
+
+# CRITICAL: Delete Composer when done (costs ~$0.25/hr just to exist)
+gcloud composer environments delete skypulse-composer \
+  --location=us-central1 \
+  --project=triptide-28062026
+```
+
+---
+
+## Additional IAM Roles Needed (discovered during Week 4)
+
+```bash
+# Dataproc Worker role — needed for Spark job service account
+gcloud projects add-iam-policy-binding triptide-28062026 \
+  --member="serviceAccount:skypulse-ingestion-sa@triptide-28062026.iam.gserviceaccount.com" \
+  --role="roles/dataproc.worker"
+
+# BigQuery Read Session — needed for Spark to read BigQuery via Storage API
+gcloud projects add-iam-policy-binding triptide-28062026 \
+  --member="serviceAccount:skypulse-ingestion-sa@triptide-28062026.iam.gserviceaccount.com" \
+  --role="roles/bigquery.readSessionUser"
+
+# Enable BigQuery Storage API (required for Spark BigQuery connector)
+gcloud services enable bigquerystorage.googleapis.com --project=triptide-28062026
+```
+
+---
+
+## Additional BigQuery Tables (Week 4)
+
+```sql
+-- Create pipeline audit log table
+bq mk --table triptide-28062026:skypulse.pipeline_audit_log \
+  run_date:STRING,run_timestamp:STRING,silver_rows:INTEGER,\
+gold_rows:INTEGER,late_arrivals:INTEGER,late_rate:FLOAT,\
+reconciled_count:INTEGER,status:STRING
+
+-- Query audit log
+SELECT * FROM triptide-28062026.skypulse.pipeline_audit_log
+ORDER BY run_timestamp DESC
+LIMIT 5
+```
+
+
+---
+
+## Week 4 Lessons Learned
+
+| Issue | Root Cause | Fix |
+|---|---|---|
+| Composer creation failed — missing permissions | Composer Service Agent missing ServiceAgentV2Ext role | Grant roles/composer.ServiceAgentV2Ext to service-47109282086@cloudcomposer-accounts.iam.gserviceaccount.com |
+| Composer creation failed — missing APIs | container.googleapis.com not enabled | Enable container API before creating Composer |
+| Cannot delete Composer while CREATING | GCP doesn't allow delete during provisioning | Wait for RUNNING state then delete |
+| BigQueryHook.get_records() error | Missing location parameter | Add location="us-central1" to BigQueryHook |
+| Spark batch failed — missing permissions | skypulse-ingestion-sa missing dataproc.worker role | Grant roles/dataproc.worker |
+| Spark batch failed — PERMISSION_DENIED bigquery.readsessions.create | BigQuery Storage API not enabled | Enable bigquerystorage.googleapis.com + grant roles/bigquery.readSessionUser |
+| Dataflow zone exhaustion in us-east1-b | Zone out of capacity | Switch to us-west1 region |
+| Silver freshness check failing | Dataflow cancelled, no recent data | Restart Dataflow before triggering DAG |
+| Late arrival rate 18.97% (above 10% threshold) | Dataflow processing backlog — messages had large event_ts vs ingestion_ts gap | Expected during catch-up; reconciliation branch triggered correctly |

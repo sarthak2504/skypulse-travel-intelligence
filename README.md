@@ -1,10 +1,10 @@
-# SkyPulse ✈️
+# SkyPulse ✈️ GCP # Google Cloud Icons [<img alt="Google Cloud Logo" src="/docs/favicon.ico" height="96" align="right"/>](https://cloud.google.com/icons)
 
 **A real-time flight price intelligence platform built on GCP.**
 
 SkyPulse ingests live flight data, streams pricing signals through a production-grade pipeline, detects price anomalies using statistical analysis, and serves analytics through both SQL and natural language interfaces.
 
-Built to demonstrate end-to-end data engineering across GCP, Apache Beam, PySpark, Snowflake, Terraform, and the Claude API.
+Built to demonstrate end-to-end data engineering across GCP, Apache Beam, PySpark, Airflow, Snowflake, Terraform, and the Claude API.
 
 ---
 
@@ -54,8 +54,28 @@ A daily PySpark job on Dataproc Serverless transforms the raw Silver data into a
 - Writes clean rows to `fact_flight_prices`
 - Updates a watermark table for incremental processing
 
-### 🔜 Orchestration + Data Quality (Week 4)
-Cloud Composer DAG triggering the daily Spark job, running rule-based DQ checks, reconciling late arrivals, and sending pipeline health alerts.
+### ✅ Orchestration + Data Quality
+A Cloud Composer (managed Airflow) DAG runs daily at 6am UTC:
+
+```
+check_silver_freshness     → Silver must have data within last 2 hours
+        ↓
+check_silver_row_counts    → minimum 100 new rows expected daily
+        ↓
+check_null_rates           → critical fields must be <1% null
+        ↓
+run_spark_batch_job        → triggers Dataproc Serverless batch_job.py
+        ↓
+check_gold_freshness       → Gold must receive new rows after Spark
+        ↓
+check_late_arrivals_volume → alerts if late rate exceeds 10%
+        ↓
+reconcile_late_arrivals    → reprocesses late data if threshold exceeded
+        ↓
+write_audit_log            → records run summary to pipeline_audit_log
+```
+
+First successful run: 21,641 Silver rows processed → 11,191 Gold rows written → 4,131 late arrivals reconciled.
 
 ### 🔜 Infrastructure as Code (Week 5)
 Terraform provisioning the entire GCP stack. Secret Manager for API keys.
@@ -75,7 +95,7 @@ AviationStack API
         │ (1 call/day — real ORD schedules)
         ▼
 Cloud Function A ──────────────────────► GCS Bronze
-(daily, 6am UTC)                         (raw schedules)
+(daily)                                  (raw schedules)
                                               │
                                          GCS Silver
                                          (active_routes)
@@ -94,15 +114,20 @@ Cloud Function B ◄────────────────────
         └── Late Arrivals ──────────────► price_1hr_trend
                                           late_arrivals
                                               │
+                              Cloud Composer (Airflow DAG)
+                              ├── DQ checks (freshness, counts, nulls)
+                              ├── Trigger Dataproc Serverless
+                              ├── Late arrival reconciliation
+                              └── Audit log
+                                              │
                                     PySpark (Dataproc Serverless)
-                                    (daily batch job)
                                               │
                                               ▼
                                     BigQuery Gold (star schema)
-                                    ├── fact_flight_prices
-                                    ├── dim_flights (SCD Type 2)
-                                    ├── dim_airlines
-                                    └── dim_date
+                                    ├── fact_flight_prices (11,191+ rows)
+                                    ├── dim_flights (36 rows, SCD Type 2)
+                                    ├── dim_airlines (5 rows)
+                                    └── dim_date (3 rows)
 ```
 
 ---
@@ -125,55 +150,85 @@ fact_flight_prices
 
 ---
 
+## Sample Business Queries
+
+```sql
+-- Which airline is cheapest on ORD-LAX?
+SELECT a.airline_name, AVG(f.avg_price_usd) as avg_price
+FROM fact_flight_prices f
+JOIN dim_flights fl ON f.flight_key = fl.flight_key
+JOIN dim_airlines a ON f.airline_key = a.airline_key
+WHERE fl.route_id = 'ORD-LAX'
+GROUP BY a.airline_name
+ORDER BY avg_price ASC
+
+-- Price anomalies today
+SELECT fl.flight_number, fl.route_id, f.window_start, f.avg_price_usd, f.z_score
+FROM fact_flight_prices f
+JOIN dim_flights fl ON f.flight_key = fl.flight_key
+WHERE f.is_anomaly = true
+AND DATE(f.window_start) = CURRENT_DATE()
+ORDER BY f.z_score DESC
+
+-- Are prices higher on weekends?
+SELECT d.is_weekend, AVG(f.avg_price_usd) as avg_price
+FROM fact_flight_prices f
+JOIN dim_date d ON f.date_key = d.date_key
+GROUP BY d.is_weekend
+```
+
+---
+
 ## Active Routes
 
 36 real ORD departures covering 6am-11:30pm CT across 5 airlines:
 
-| Airline | Alliance | Routes |
+| Airline | Alliance | Sample Routes |
 |---|---|---|
-| United Airlines | Star Alliance | ORD-LAX, ORD-SFO, ORD-SEA, ORD-DEN, ORD-LGA, ORD-NRT, ORD-LHR, ORD-PVG |
-| American Airlines | Oneworld | ORD-JFK, ORD-MIA, ORD-DFW, ORD-PHX, ORD-BOS, ORD-SEA, ORD-CDG, ORD-GRU |
-| Delta Air Lines | SkyTeam | ORD-ATL, ORD-BOS, ORD-ATL, ORD-AMS |
+| United Airlines | Star Alliance | ORD-LAX, ORD-SFO, ORD-NRT, ORD-LHR, ORD-PVG |
+| American Airlines | Oneworld | ORD-JFK, ORD-MIA, ORD-CDG, ORD-GRU |
+| Delta Air Lines | SkyTeam | ORD-ATL, ORD-BOS, ORD-AMS |
 | Southwest Airlines | None | ORD-DEN, ORD-DFW, ORD-STL |
 | Lufthansa | Star Alliance | ORD-FRA |
-
-Domestic prices range $80-250. International $600-1000. All with ±20% random variance and 10% peak-hour markup.
 
 ---
 
 ## Tech Stack
 
-| Layer | Technology |
-|---|---|
-| Ingestion | Cloud Functions (Python), Cloud Scheduler |
-| Data source | AviationStack API (real schedules), simulated prices |
-| Messaging | GCP Pub/Sub, Avro Schema Registry |
-| Stream Processing | Apache Beam 2.74.0, Google Dataflow |
-| Batch Processing | PySpark, Dataproc Serverless |
-| Storage | GCS (Bronze/Silver/Gold), BigQuery |
-| Orchestration | Cloud Composer — Week 4 |
-| Infrastructure | Terraform — Week 5 |
-| Analytics | Snowflake (Snowpipe, Snowpark, Cortex AI) — Weeks 6-7 |
-| AI | Claude API, pgvector, Cloud Run, Streamlit — Weeks 8-9 |
+| Layer | Technology | Status |
+|---|---|---|
+| Ingestion | Cloud Functions (Python), Cloud Scheduler | ✅ |
+| Data source | AviationStack API + simulated prices | ✅ |
+| Messaging | GCP Pub/Sub, Avro Schema Registry | ✅ |
+| Stream Processing | Apache Beam 2.74.0, Google Dataflow | ✅ |
+| Batch Processing | PySpark, Dataproc Serverless | ✅ |
+| Orchestration | Cloud Composer (managed Airflow) | ✅ |
+| Storage | GCS Bronze/Silver/Gold, BigQuery | ✅ |
+| Infrastructure | Terraform | 🔜 Week 5 |
+| Analytics | Snowflake (Snowpipe, Snowpark, Cortex AI) | 🔜 Weeks 6-7 |
+| AI | Claude API, pgvector, Cloud Run, Streamlit | 🔜 Weeks 8-9 |
 
 ---
 
 ## Key Design Decisions
 
 **Why event time windowing?**
-Flight prices should be assigned to the window when they occurred, not when Dataflow received them. A message delayed by 90 seconds belongs in the 08:00-08:05 window, not the 08:05-08:10 window.
+Flight prices should be assigned to the window when they occurred, not when Dataflow received them. A message delayed by 90 seconds belongs in the 08:00-08:05 window, not 08:05-08:10.
 
 **Why two Silver tables (5min + 1hr)?**
-They answer different questions. 5-minute windows show what the price is right now. 1-hour sliding windows show what the price typically is. Anomaly detection needs both — compare the volatile signal against the stable baseline.
+5-minute windows show what the price is right now. 1-hour sliding windows show the typical price. Anomaly detection needs both — compare the volatile signal against the stable baseline.
 
 **Why Silver has duplicates?**
-BigQuery streaming inserts are append-only. Dataflow's accumulating mode writes a second row when late data updates a window. The daily Spark job deduplicates when writing to Gold. Silver is raw and immutable; Gold is clean and analytical.
+BigQuery streaming inserts are append-only. Dataflow's accumulating mode writes a second row when late data updates a window. The daily Spark job deduplicates when writing to Gold.
 
 **Why SCD Type 2 for flights?**
-If an airline changes which routes it flies, historical price facts should still join to the correct airline for their time period. SCD Type 2 closes the old record and inserts a new one rather than overwriting.
+If an airline changes routes, historical price facts should join to the correct airline for their time period. SCD Type 2 preserves this history.
+
+**Why Cloud Composer for orchestration?**
+Airflow provides dependency management between tasks, retry logic, branching (late arrival reconciliation only triggers when threshold exceeded), and a visual DAG graph for monitoring. All more robust than cron + shell scripts.
 
 **Why Pub/Sub over Kafka?**
-Fully managed, native Dataflow integration, replay handled at GCS layer. Kafka would be chosen if message-level replay or strict ordering were required.
+Fully managed, native Dataflow integration, replay handled at GCS layer.
 
 ---
 
@@ -193,8 +248,10 @@ skypulse-travel-intelligence/
 │   └── function_b/                   ← 60-second price ticker
 ├── dataflow/
 │   └── pipeline.py                   ← Apache Beam streaming pipeline
-└── spark/
-    └── batch_job.py                  ← daily PySpark Gold layer job
+├── spark/
+│   └── batch_job.py                  ← daily PySpark Gold layer job
+└── dags/
+    └── skypulse_daily_dag.py         ← Cloud Composer Airflow DAG
 ```
 
 ---
