@@ -1,4 +1,6 @@
-# SkyPulse ✈️ GCP # Google Cloud Icons [<img alt="Google Cloud Logo" src="/docs/favicon.ico" height="96" align="right"/>](https://cloud.google.com/icons)
+# SkyPulse ✈️ GCP # Google Cloud Icons [<img alt="Google Cloud Logo" src="/docs/favicon.ico" height="60" align="right"/>](https://cloud.google.com/icons)
+
+
 
 **A real-time flight price intelligence platform built on GCP.**
 
