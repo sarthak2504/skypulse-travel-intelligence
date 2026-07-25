@@ -30,3 +30,8 @@ Thumbs.db
 # IDE
 .vscode/
 .idea/
+
+#Terraform
+*.tfvars
+.terraform/
+.terraform.lock.hcl
