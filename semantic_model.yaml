@@ -1,0 +1,124 @@
+name: SkyPulse Flight Price Analytics
+description: Real-time flight price intelligence platform monitoring ORD departures
+
+tables:
+  - name: hourly_route_summary
+    base_table:
+      database: SKYPULSE
+      schema: ANALYTICS
+      table: HOURLY_ROUTE_SUMMARY
+    description: Hourly refreshed summary of flight prices by route and date
+
+    dimensions:
+      - name: route_id
+        description: Origin-destination pair (e.g. ORD-LAX)
+        expr: ROUTE_ID
+        data_type: VARCHAR
+
+      - name: origin
+        description: Departure airport IATA code
+        expr: ORIGIN
+        data_type: VARCHAR
+
+      - name: destination
+        description: Arrival airport IATA code
+        expr: DESTINATION
+        data_type: VARCHAR
+
+      - name: date
+        description: Date of the flights
+        expr: DATE
+        data_type: VARCHAR
+
+      - name: season
+        description: Season (Summer, Winter, Spring, Fall)
+        expr: SEASON
+        data_type: VARCHAR
+
+      - name: is_weekend
+        description: Whether the date falls on a weekend
+        expr: IS_WEEKEND
+        data_type: BOOLEAN
+
+    measures:
+      - name: avg_price
+        description: Average ticket price in USD
+        expr: AVG_PRICE
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: min_price
+        description: Minimum ticket price in USD
+        expr: MIN_PRICE
+        data_type: FLOAT
+        default_aggregation: min
+
+      - name: max_price
+        description: Maximum ticket price in USD
+        expr: MAX_PRICE
+        data_type: FLOAT
+        default_aggregation: max
+
+      - name: airline_count
+        description: Number of airlines serving this route
+        expr: AIRLINE_COUNT
+        data_type: INTEGER
+        default_aggregation: max
+
+      - name: total_anomalies
+        description: Number of price anomalies detected
+        expr: TOTAL_ANOMALIES
+        data_type: INTEGER
+        default_aggregation: sum
+
+  - name: route_stats
+    base_table:
+      database: SKYPULSE
+      schema: GOLD
+      table: ROUTE_STATS
+    description: Daily route statistics including cheapest airline per route
+
+    dimensions:
+      - name: route_id
+        description: Origin-destination pair
+        expr: ROUTE_ID
+        data_type: VARCHAR
+
+      - name: origin
+        description: Departure airport
+        expr: ORIGIN
+        data_type: VARCHAR
+
+      - name: destination
+        description: Arrival airport
+        expr: DESTINATION
+        data_type: VARCHAR
+
+      - name: date
+        description: Date
+        expr: DATE
+        data_type: VARCHAR
+
+      - name: cheapest_airline
+        description: Airline with the lowest price on this route
+        expr: CHEAPEST_AIRLINE
+        data_type: VARCHAR
+
+    measures:
+      - name: min_price_usd
+        description: Cheapest ticket price on this route
+        expr: MIN_PRICE_USD
+        data_type: FLOAT
+        default_aggregation: min
+
+      - name: avg_price_usd
+        description: Average ticket price on this route
+        expr: AVG_PRICE_USD
+        data_type: FLOAT
+        default_aggregation: avg
+
+      - name: airline_count
+        description: Number of airlines serving this route
+        expr: AIRLINE_COUNT
+        data_type: INTEGER
+        default_aggregation: max

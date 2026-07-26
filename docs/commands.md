@@ -592,3 +592,84 @@ LIMIT 5
 | Dataflow zone exhaustion in us-east1-b | Zone out of capacity | Switch to us-west1 region |
 | Silver freshness check failing | Dataflow cancelled, no recent data | Restart Dataflow before triggering DAG |
 | Late arrival rate 18.97% (above 10% threshold) | Dataflow processing backlog — messages had large event_ts vs ingestion_ts gap | Expected during catch-up; reconciliation branch triggered correctly |
+
+---
+
+## Snowflake (Week 6)
+
+All Snowflake setup is done via SQL worksheets in the Snowflake UI.
+Full setup script: `snowflake/setup.sql`
+
+```
+Account URL: https://app.snowflake.com/bgzutol/wg59288
+Region: AWS us-east-2
+```
+
+### GCS Integration
+
+```bash
+# After creating storage integration in Snowflake, grant access:
+# Get service account from DESC INTEGRATION gcs_skypulse_integration
+# Then grant objectViewer on GCS bucket:
+gsutil iam ch serviceAccount:kinz40000@awsuseast2-a5c7.iam.gserviceaccount.com:objectViewer gs://skypulse-triptide
+
+# Verify grant applied
+gsutil iam get gs://skypulse-triptide
+```
+
+### Key Snowflake SQL Commands
+
+```sql
+-- Check what's loaded in Silver
+SELECT COUNT(*) as total_rows,
+       COUNT(DISTINCT flight_date) as unique_dates,
+       MIN(flight_date) as earliest_date,
+       MAX(flight_date) as latest_date
+FROM SKYPULSE.SILVER.raw_flights;
+
+-- Manually trigger Snowpipe for new Bronze files
+ALTER PIPE SKYPULSE.SILVER.gcs_routes_pipe REFRESH;
+
+-- Check Dynamic Table freshness
+SELECT last_updated FROM SKYPULSE.ANALYTICS.hourly_route_summary
+ORDER BY last_updated DESC LIMIT 1;
+
+-- Test semantic view
+SELECT * FROM SEMANTIC_VIEW(
+    flight_price_semantic_view
+    METRICS (hourly_route_summary.avg_price)
+    DIMENSIONS (hourly_route_summary.route_id, hourly_route_summary.season)
+)
+ORDER BY avg_price ASC LIMIT 10;
+
+-- Grant Cortex Analyst access
+USE ROLE ACCOUNTADMIN;
+GRANT DATABASE ROLE SNOWFLAKE.CORTEX_USER TO ROLE ACCOUNTADMIN;
+```
+
+### Snowflake Object Summary
+
+| Object | Type | Description |
+|---|---|---|
+| SKYPULSE | Database | Main database |
+| SKYPULSE.SILVER | Schema | Raw ingested data |
+| SKYPULSE.GOLD | Schema | Analytics tables |
+| SKYPULSE.ANALYTICS | Schema | Serving layer |
+| SKYPULSE_WH | Warehouse | X-SMALL, auto-suspend 60s |
+| gcs_skypulse_integration | Storage Integration | GCS authentication |
+| gcs_bronze_stage | External Stage | Points to GCS Bronze |
+| SILVER.raw_flights | Table | 1,897 rows AviationStack data |
+| SILVER.gcs_routes_pipe | Snowpipe | Auto-ingests new Bronze files |
+| GOLD.flight_price_summary | Table | 1,897 rows per flight per day |
+| GOLD.route_stats | Table | 597 rows per route per day |
+| ANALYTICS.hourly_route_summary | Dynamic Table | Auto-refreshes hourly |
+| ANALYTICS.flight_price_semantic_view | Semantic View | Powers Cortex Analyst |
+
+### Week 6 Lessons Learned
+
+| Issue | Root Cause | Fix |
+|---|---|---|
+| CREATE SEMANTIC VIEW syntax error | COMMENT inline with dimensions not supported in this version | Remove inline COMMENTs |
+| Semantic view dimension syntax error | Cannot just list column names — need AS expression | Use `table.col AS table.col` format |
+| Cortex Analyst not visible in UI | Role missing SNOWFLAKE.CORTEX_USER privilege | Grant via ACCOUNTADMIN |
+| Snowflake recommends Semantic Views over YAML | New feature GA mid-2025 | Use CREATE SEMANTIC VIEW instead of YAML file approach |

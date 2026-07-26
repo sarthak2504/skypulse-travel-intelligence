@@ -1,8 +1,6 @@
-# SkyPulse ✈️ GCP [<img alt="Google Cloud Logo" src="/docs/favicon.ico" height="50" align="right"/>](https://cloud.google.com/icons)
+# SkyPulse ✈️ &nbsp; <img src="/docs/favicon.ico" height="40"/> &nbsp; <img src="/docs/snowflake_computing_logo.jpeg" height="40"/>
 
-
-
-**A real-time flight price intelligence platform built on GCP.**
+**A real-time flight price intelligence platform built on GCP + Snowflake.**
 
 SkyPulse ingests live flight data, streams pricing signals through a production-grade pipeline, detects price anomalies using statistical analysis, and serves analytics through both SQL and natural language interfaces.
 
@@ -18,8 +16,9 @@ SkyPulse monitors flight prices across 36 ORD departure routes — domestic and 
 - Which airline is consistently cheapest on this route?
 - Did something unusual just happen with ORD-JFK prices?
 - Which routes are cheapest on weekend mornings in July?
+- Show me flights from Chicago to Austin this summer
 
-Prices are streamed every 60 seconds. Anomalies are detected by comparing each 5-minute price snapshot against a 1-hour rolling baseline. The full day's data lands in a star schema queryable by any BI tool or natural language interface.
+Prices are streamed every 60 seconds. Anomalies are detected by comparing each 5-minute price snapshot against a 1-hour rolling baseline. The full day's data lands in a star schema queryable by any BI tool or in plain English via Cortex Analyst.
 
 ---
 
@@ -79,11 +78,18 @@ write_audit_log            → records run summary to pipeline_audit_log
 
 First successful run: 21,641 Silver rows processed → 11,191 Gold rows written → 4,131 late arrivals reconciled.
 
-### 🔜 Infrastructure as Code (Week 5)
-Terraform provisioning the entire GCP stack. Secret Manager for API keys.
+### ✅ Infrastructure as Code
+Terraform provisions the entire GCP stack — GCS bucket, Pub/Sub topics, IAM service accounts, BigQuery datasets and tables, Cloud Scheduler jobs, and Secret Manager. All resources defined as code for reproducible deployments.
 
-### 🔜 Snowflake Integration (Weeks 6-7)
-Snowpipe continuous ingestion, Snowpark transformations, Dynamic Tables for hourly summaries, Cortex Analyst for natural language SQL.
+### ✅ Snowflake Analytics Layer
+Snowflake serves as the analytics serving layer on top of the GCP processing pipeline:
+
+- **Snowpipe** continuously ingests daily AviationStack schedule files from GCS Bronze
+- **Silver table** (`raw_flights`) — 1,897 rows of real flight schedule data across 19 days
+- **Gold tables** — denormalized price summaries by flight and route
+- **Dynamic Table** (`hourly_route_summary`) — auto-refreshes every hour, always current
+- **Semantic View** — defines business vocabulary (routes, prices, seasons, alliances)
+- **Cortex Analyst** — natural language queries: "show me flights from Chicago to Austin" → SQL → answer
 
 ### 🔜 AI Layer (Weeks 8-9)
 Claude API agent with vector search over routes, BigQuery and Snowflake query tools, and a Streamlit chat interface on Cloud Run.
@@ -96,20 +102,17 @@ Claude API agent with vector search over routes, BigQuery and Snowflake query to
 AviationStack API
         │ (1 call/day — real ORD schedules)
         ▼
-Cloud Function A ──────────────────────► GCS Bronze
-(daily)                                  (raw schedules)
-                                              │
-                                         GCS Silver
-                                         (active_routes)
-                                              │
-Cloud Function B ◄────────────────────────────┘
-(every 60 sec)
-        │ Avro messages
-        ▼
-   Pub/Sub ──────────────────────────────► Dead Letter Queue
-(flight-prices-raw)                      (flight-prices-dlq)
-        │
-        ▼
+Cloud Function A ──────────────────────► GCS Bronze ──────────────────► Snowflake
+(daily)                                  (raw schedules)    Snowpipe    SILVER.raw_flights
+                                                                              │
+Cloud Function B ◄────────────────────────────┘                    SQL transforms
+(every 60 sec)                                                            │
+        │ Avro messages                                          Snowflake GOLD
+        ▼                                                        Dynamic Tables
+   Pub/Sub ──────────────────────────────► Dead Letter Queue     Semantic View
+(flight-prices-raw)                      (flight-prices-dlq)     Cortex Analyst
+        │                                                              ↑
+        ▼                                                    Natural language queries
    Dataflow (Apache Beam)
         ├── Fixed Window 5min ──────────► BigQuery Silver
         ├── Sliding Window 1hr ─────────► price_5min_avg
@@ -117,7 +120,7 @@ Cloud Function B ◄────────────────────
                                           late_arrivals
                                               │
                               Cloud Composer (Airflow DAG)
-                              ├── DQ checks (freshness, counts, nulls)
+                              ├── DQ checks
                               ├── Trigger Dataproc Serverless
                               ├── Late arrival reconciliation
                               └── Audit log
@@ -136,7 +139,8 @@ Cloud Function B ◄────────────────────
 
 ## Data Model
 
-**Grain:** one row in `fact_flight_prices` = one flight × one 5-minute window
+### BigQuery Gold (GCP)
+**Grain:** one row = one flight × one 5-minute window
 
 ```
 fact_flight_prices
@@ -150,33 +154,38 @@ fact_flight_prices
 └── is_anomaly    (z_score > 3)
 ```
 
+### Snowflake (Analytics Serving)
+```
+SILVER.raw_flights          ← real AviationStack schedule data
+GOLD.flight_price_summary   ← per flight per day with prices
+GOLD.route_stats            ← per route per day aggregated
+ANALYTICS.hourly_route_summary ← Dynamic Table, auto-refreshes hourly
+ANALYTICS.flight_price_semantic_view ← powers Cortex Analyst
+```
+
 ---
 
 ## Sample Business Queries
 
 ```sql
--- Which airline is cheapest on ORD-LAX?
+-- BigQuery: Which airline is cheapest on ORD-LAX?
 SELECT a.airline_name, AVG(f.avg_price_usd) as avg_price
 FROM fact_flight_prices f
 JOIN dim_flights fl ON f.flight_key = fl.flight_key
 JOIN dim_airlines a ON f.airline_key = a.airline_key
 WHERE fl.route_id = 'ORD-LAX'
-GROUP BY a.airline_name
-ORDER BY avg_price ASC
+GROUP BY a.airline_name ORDER BY avg_price ASC
 
--- Price anomalies today
-SELECT fl.flight_number, fl.route_id, f.window_start, f.avg_price_usd, f.z_score
-FROM fact_flight_prices f
-JOIN dim_flights fl ON f.flight_key = fl.flight_key
-WHERE f.is_anomaly = true
-AND DATE(f.window_start) = CURRENT_DATE()
-ORDER BY f.z_score DESC
+-- Snowflake: Price anomalies today
+SELECT route_id, avg_price, total_anomalies
+FROM SKYPULSE.ANALYTICS.hourly_route_summary
+WHERE total_anomalies > 0
+ORDER BY total_anomalies DESC
 
--- Are prices higher on weekends?
-SELECT d.is_weekend, AVG(f.avg_price_usd) as avg_price
-FROM fact_flight_prices f
-JOIN dim_date d ON f.date_key = d.date_key
-GROUP BY d.is_weekend
+-- Snowflake Cortex Analyst: plain English
+-- "Show me the cheapest flights from Chicago to Asia this summer"
+-- "Which routes are most expensive on weekends?"
+-- "How many airlines fly from ORD to London?"
 ```
 
 ---
@@ -206,8 +215,8 @@ GROUP BY d.is_weekend
 | Batch Processing | PySpark, Dataproc Serverless | ✅ |
 | Orchestration | Cloud Composer (managed Airflow) | ✅ |
 | Storage | GCS Bronze/Silver/Gold, BigQuery | ✅ |
-| Infrastructure | Terraform | 🔜 Week 5 |
-| Analytics | Snowflake (Snowpipe, Snowpark, Cortex AI) | 🔜 Weeks 6-7 |
+| Infrastructure | Terraform | ✅ |
+| Analytics Serving | Snowflake (Snowpipe, Dynamic Tables, Cortex Analyst) | ✅ |
 | AI | Claude API, pgvector, Cloud Run, Streamlit | 🔜 Weeks 8-9 |
 
 ---
@@ -215,19 +224,19 @@ GROUP BY d.is_weekend
 ## Key Design Decisions
 
 **Why event time windowing?**
-Flight prices should be assigned to the window when they occurred, not when Dataflow received them. A message delayed by 90 seconds belongs in the 08:00-08:05 window, not 08:05-08:10.
+Flight prices should be assigned to the window when they occurred, not when Dataflow received them.
 
 **Why two Silver tables (5min + 1hr)?**
-5-minute windows show what the price is right now. 1-hour sliding windows show the typical price. Anomaly detection needs both — compare the volatile signal against the stable baseline.
+5-minute windows show what the price is right now. 1-hour sliding windows show the typical price. Anomaly detection needs both.
 
 **Why Silver has duplicates?**
-BigQuery streaming inserts are append-only. Dataflow's accumulating mode writes a second row when late data updates a window. The daily Spark job deduplicates when writing to Gold.
+BigQuery streaming inserts are append-only. Accumulating mode writes a second row when late data updates a window. Spark deduplicates when writing to Gold.
 
 **Why SCD Type 2 for flights?**
-If an airline changes routes, historical price facts should join to the correct airline for their time period. SCD Type 2 preserves this history.
+If an airline changes routes, historical price facts should join to the correct airline for their time period.
 
-**Why Cloud Composer for orchestration?**
-Airflow provides dependency management between tasks, retry logic, branching (late arrival reconciliation only triggers when threshold exceeded), and a visual DAG graph for monitoring. All more robust than cron + shell scripts.
+**Why both BigQuery AND Snowflake?**
+BigQuery handles heavy streaming processing and anomaly detection. Snowflake handles analytics serving and natural language queries via Cortex Analyst. In production you'd choose one — for a portfolio project demonstrating both platforms is the goal.
 
 **Why Pub/Sub over Kafka?**
 Fully managed, native Dataflow integration, replay handled at GCS layer.
@@ -239,12 +248,12 @@ Fully managed, native Dataflow integration, replay handled at GCS layer.
 ```
 skypulse-travel-intelligence/
 ├── README.md                         ← this file
-├── README_TECHNICAL.md               ← architecture diagrams, setup instructions
-├── commands.md                       ← every GCP CLI command used, with explanations
+├── README_TECHNICAL.md               ← architecture diagrams, setup
+├── commands.md                       ← every CLI command used
 ├── docs/
 │   └── streaming_writes_reference.md ← BigQuery vs Iceberg, upserts, z-scores
 ├── schemas/
-│   └── flight_price.avsc             ← Avro schema registered in Pub/Sub
+│   └── flight_price.avsc             ← Avro schema
 ├── functions/
 │   ├── function_a/                   ← daily route refresh
 │   └── function_b/                   ← 60-second price ticker
@@ -252,8 +261,15 @@ skypulse-travel-intelligence/
 │   └── pipeline.py                   ← Apache Beam streaming pipeline
 ├── spark/
 │   └── batch_job.py                  ← daily PySpark Gold layer job
-└── dags/
-    └── skypulse_daily_dag.py         ← Cloud Composer Airflow DAG
+├── dags/
+│   └── skypulse_daily_dag.py         ← Cloud Composer Airflow DAG
+├── terraform/
+│   ├── main.tf                       ← all GCP resources as IaC
+│   ├── variables.tf
+│   ├── outputs.tf
+│   └── provider.tf
+└── snowflake/
+    └── setup.sql                     ← all Snowflake SQL in order
 ```
 
 ---
