@@ -58,6 +58,8 @@ AviationStack API (real flight routes, ORD departures)
 │  └── price_5min_avg                                  │
 │  └── price_1hr_trend                                 │
 │  └── late_arrivals                                   │
+│  └── pipeline_watermarks                             │
+│  └── pipeline_audit_log                              │
 │  BigQuery Gold (clean star schema):                  │
 │  └── fact_flight_prices (11,191+ rows)               │
 │  └── dim_flights (SCD Type 2, 36 rows)               │
@@ -96,29 +98,41 @@ AviationStack API (real flight routes, ORD departures)
 │  First run results:                                  │
 │  └── 21,641 Silver rows processed                    │
 │  └── 11,191 Gold rows written                        │
-│  └── 4,131 late arrivals reconciled                  │
+│  └── 4,131 late arrivals reconciled (18.97% rate)    │
 │  └── Status: SUCCESS                                 │
 └─────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────┐
-│            INFRASTRUCTURE AS CODE      🔜 Week 5     │
+│            INFRASTRUCTURE AS CODE         ✅ Done    │
 │                                                      │
-│  Terraform                                           │
-│  └── All GCP resources as code                       │
-│  └── Secret Manager for API keys                     │
-│  └── Reproducible dev + prod environments            │
+│  Terraform (v1.15.8)                                 │
+│  └── GCS bucket + lifecycle policy                   │
+│  └── IAM service account + 8 role bindings           │
+│  └── Pub/Sub topics + subscription + schema          │
+│  └── BigQuery Silver + Gold datasets + all tables    │
+│  └── Cloud Scheduler jobs                            │
+│  └── Secret Manager secret                           │
+│  Note: Resources created manually, Terraform         │
+│  documents IaC. Fresh terraform apply works on       │
+│  a new project.                                      │
 └─────────────────────────────────────────────────────┘
         │
         ▼
 ┌─────────────────────────────────────────────────────┐
-│               ANALYTICS SERVING        🔜 Weeks 6-7  │
+│               ANALYTICS SERVING           ✅ Done    │
 │                                                      │
-│  Snowflake                                           │
-│  └── Snowpipe: continuous ingestion from GCS         │
-│  └── Snowpark: Python transformations                │
-│  └── Dynamic Tables: materialized hourly summary     │
-│  └── Cortex Analyst: natural language queries        │
+│  Snowflake (AWS us-east-2, trial account)            │
+│  └── Storage integration → GCS authentication        │
+│  └── Snowpipe: auto-ingests Bronze files daily       │
+│  └── SILVER.raw_flights: 1,897 rows AviationStack   │
+│  └── GOLD.flight_price_summary: 1,897 rows          │
+│  └── GOLD.route_stats: 597 rows                     │
+│  └── ANALYTICS.hourly_route_summary: Dynamic Table  │
+│      (auto-refreshes hourly, 597 rows)               │
+│  └── Semantic View: flight_price_semantic_view       │
+│  └── Cortex Analyst: natural language → SQL          │
+│      "Show me flights from Chicago to Austin"        │
 └─────────────────────────────────────────────────────┘
         │
         ▼
@@ -137,7 +151,7 @@ AviationStack API (real flight routes, ORD departures)
 
 ## Data Model
 
-### Silver Layer (BigQuery)
+### GCP — BigQuery Silver Layer
 
 **price_5min_avg** — 5-minute windowed average price per flight
 ```
@@ -145,7 +159,7 @@ flight_number, route_id, origin, destination, airline_code, airline_name,
 window_start, window_end, avg_price_usd, min_price_usd, max_price_usd,
 message_count, processing_timestamp
 ```
-Note: May contain duplicates from accumulating mode. Deduplication happens in Spark.
+Note: May contain duplicates from accumulating mode. Deduplication in Spark.
 
 **price_1hr_trend** — 1-hour sliding window average per flight
 ```
@@ -171,7 +185,7 @@ run_date, run_timestamp, silver_rows, gold_rows,
 late_arrivals, late_rate, reconciled_count, status
 ```
 
-### Gold Layer (BigQuery)
+### GCP — BigQuery Gold Layer
 
 **Grain:** One row in `fact_flight_prices` = one flight × one 5-minute window
 
@@ -201,6 +215,37 @@ date_key, date, day_of_week, day_number,
 is_weekend, month, quarter, is_us_holiday, season
 ```
 
+### Snowflake Layer
+
+**SILVER.raw_flights** — raw AviationStack schedule data
+```
+flight_date, flight_status, departure_airport, departure_iata,
+departure_scheduled, arrival_airport, arrival_iata, arrival_scheduled,
+airline_name, airline_iata, flight_number, flight_iata,
+codeshared_airline, codeshared_flight, raw_json, loaded_at
+```
+
+**GOLD.flight_price_summary** — per flight per day with prices
+```
+flight_number, route_id, origin, destination, airline_name, alliance,
+date, is_weekend, season, avg_price_usd, min_price_usd, max_price_usd,
+anomaly_count, window_count, loaded_at
+```
+
+**GOLD.route_stats** — per route per day aggregated
+```
+route_id, origin, destination, date, airline_count,
+cheapest_airline, min_price_usd, avg_price_usd, max_price_usd,
+anomaly_count, loaded_at
+```
+
+**ANALYTICS.hourly_route_summary** — Dynamic Table, auto-refreshes hourly
+```
+route_id, origin, destination, date, season, is_weekend,
+airline_count, avg_price, min_price, max_price,
+total_anomalies, last_updated
+```
+
 ---
 
 ## Airflow DAG Structure
@@ -223,37 +268,67 @@ reconcile_late_arrivals    write_audit_log
 write_audit_log
 ```
 
-**Branch logic:** `check_late_arrivals_volume` checks if late arrival rate exceeds 10%. If yes → runs `reconcile_late_arrivals` before `write_audit_log`. If no → skips directly to `write_audit_log`.
+**Branch logic:** late rate > 10% → reconcile → audit log. Otherwise → audit log directly.
 
-**Trigger rule on audit log:** `none_failed_min_one_success` — audit log runs regardless of which branch was taken.
+**Trigger rule on audit log:** `none_failed_min_one_success` — runs regardless of branch taken.
+
+---
+
+## Snowflake Object Hierarchy
+
+```
+Account: bgzutol/wg59288 (AWS us-east-2)
+    └── Database: SKYPULSE
+            ├── Schema: SILVER
+            │   ├── Table: raw_flights (1,897 rows)
+            │   └── Pipe: gcs_routes_pipe (Snowpipe)
+            ├── Schema: GOLD
+            │   ├── Table: flight_price_summary (1,897 rows)
+            │   └── Table: route_stats (597 rows)
+            └── Schema: ANALYTICS
+                ├── Dynamic Table: hourly_route_summary (597 rows, lag=1hr)
+                └── Semantic View: flight_price_semantic_view
+    └── Warehouse: SKYPULSE_WH (X-SMALL, auto-suspend 60s)
+    └── Storage Integration: gcs_skypulse_integration (→ GCS)
+    └── External Stage: gcs_bronze_stage (→ gs://skypulse-triptide/bronze/routes/)
+```
 
 ---
 
 ## Architectural Decisions
 
-### Why event time over processing time?
-Event time ensures every price tick is assigned to the window when the price actually occurred, not when Dataflow received it. Processing time windowing would silently assign late messages to wrong windows.
+**Why event time over processing time?**
+Event time ensures every price tick is assigned to the window when the price actually occurred. Processing time windowing would silently assign late messages to wrong windows.
 
-### Why fixed AND sliding windows?
-Fixed windows (5-min) answer "what is the price right now?" — volatile, one row per flight per 5-min interval. Sliding windows (1-hr/15-min) answer "what is the typical price?" — smooth rolling baseline. Both are needed for anomaly detection.
+**Why fixed AND sliding windows?**
+Fixed windows (5-min) answer "what is the price right now?" Sliding windows (1-hr/15-min) answer "what is the typical price?" Both needed for anomaly detection.
 
-### Why BigQuery Silver has duplicates?
-BigQuery streaming inserts are append-only. Dataflow's accumulating mode fires a window result twice — once at watermark, again if late data arrives. Deduplication happens in the Spark batch job using ROW_NUMBER() window function.
+**Why BigQuery Silver has duplicates?**
+BigQuery streaming inserts are append-only. Dataflow's accumulating mode fires a window result twice. Deduplication happens in Spark using ROW_NUMBER() window function.
 
-### Why two layers (Silver + Gold)?
-Silver is raw and immutable — full history, used for reprocessing and audit. Gold is clean and analytical — deduplicated, dimensional, optimized for queries. Separation follows the principle that raw data should never be modified.
+**Why two layers (Silver + Gold)?**
+Silver is raw and immutable — full history, used for reprocessing. Gold is clean and analytical — deduplicated, dimensional, optimized for queries.
 
-### Why SCD Type 2 for dim_flights?
+**Why SCD Type 2 for dim_flights?**
 Flight attributes change occasionally. SCD Type 2 preserves history so historical price facts always join to the correct flight attributes for their time period.
 
-### Why Dataproc Serverless over a managed cluster?
+**Why Dataproc Serverless?**
 Batch job runs once daily, completes in 2-3 minutes. Serverless charges only for execution time — no idle cluster cost.
 
-### Why Cloud Composer for orchestration?
-Airflow provides dependency management, retry logic, branching (late arrival reconciliation only when threshold exceeded), XCom for passing data between tasks, and a visual DAG graph. More robust than cron + shell scripts.
+**Why Cloud Composer?**
+Airflow provides dependency management, retry logic, branching, XCom for passing data between tasks, and a visual DAG graph. More robust than cron + shell scripts.
 
-### Why Pub/Sub over Kafka?
-Fully managed, native Dataflow integration, replay handled at GCS layer. Kafka for message-level replay or strict ordering requirements.
+**Why both BigQuery AND Snowflake?**
+BigQuery handles streaming processing and anomaly detection. Snowflake handles analytics serving with natural language queries via Cortex Analyst. Demonstrates multi-platform expertise for portfolio purposes.
+
+**Why Snowflake uses simulated prices?**
+AviationStack free tier provides schedule data only — no pricing data. Prices are simulated in both GCP (Function B, ±20% variance) and Snowflake (SQL UNIFORM() function). In production, BigQuery Gold would export to GCS and Snowpipe would load real prices into Snowflake.
+
+**Why Dynamic Tables over scheduled tasks?**
+Dynamic Tables auto-refresh when source data changes — no cron job, no Airflow task, no manual intervention. Snowflake handles the refresh dependency chain automatically.
+
+**Why Semantic Views over YAML for Cortex Analyst?**
+Snowflake deprecated the YAML file approach in favor of native SQL Semantic Views — better RBAC, governance, and tooling support. CREATE SEMANTIC VIEW is the current recommended approach.
 
 ---
 
@@ -288,8 +363,9 @@ is_anomaly = z_score > 3.0
 | skypulse-ingestion-sa | roles/dataproc.worker | Run Dataproc Serverless jobs |
 | skypulse-ingestion-sa | roles/bigquery.readSessionUser | Read BigQuery via Storage API |
 | service-47109282086@cloudcomposer-accounts | roles/composer.ServiceAgentV2Ext | Composer internal operations |
-| service-47109282086@gcp-sa-pubsub | roles/pubsub.publisher (on DLQ topic) | Forward failed messages to DLQ |
-| service-47109282086@gcp-sa-pubsub | roles/pubsub.subscriber (on main sub) | Read messages for DLQ forwarding |
+| service-47109282086@gcp-sa-pubsub | roles/pubsub.publisher (DLQ topic) | Forward failed messages to DLQ |
+| service-47109282086@gcp-sa-pubsub | roles/pubsub.subscriber (main sub) | Read messages for DLQ forwarding |
+| kinz40000@awsuseast2-a5c7 (Snowflake SA) | roles/storage.objectViewer (GCS bucket) | Snowpipe reads Bronze files |
 
 ---
 
@@ -309,6 +385,7 @@ bigquerystorage.googleapis.com
 dataproc.googleapis.com
 composer.googleapis.com
 container.googleapis.com
+secretmanager.googleapis.com
 ```
 
 ---
@@ -325,12 +402,11 @@ container.googleapis.com
 | Dataproc Serverless | 2-3 min/day | ~$0.15/day |
 | BigQuery | Query time | ~$0 (free tier) |
 | Cloud Composer | When environment exists | ~$6/day |
-| **Total (Dataflow + Composer)** | | **~$8.50/day** |
+| Snowflake | Query time | ~$0 (trial credits) |
 | **Total (Dataflow only)** | | **~$2.55/day** |
+| **Total (Dataflow + Composer)** | | **~$8.50/day** |
 
-All covered by GCP $300 free trial credits.
-
-**Cost tip:** Delete Composer after testing each week. Recreate only when deploying/testing DAG changes. Dataflow can run continuously during active development weeks.
+**Cost tip:** Delete Composer after testing each week. Recreate only when deploying DAG changes. Snowflake trial provides $400 in credits for 30 days.
 
 ---
 
@@ -338,11 +414,13 @@ All covered by GCP $300 free trial credits.
 
 ### Prerequisites
 - GCP account with billing enabled
+- Snowflake trial account (trial.snowflake.com)
 - `gcloud` CLI installed and authenticated
-- Python 3.11+ (Beam 2.74.0 requires Python 3.11-3.13)
-- AviationStack free API key (aviationstack.com)
+- Python 3.11+
+- Terraform v1.0+
+- AviationStack free API key
 
-### Deploy
+### GCP Deploy
 
 ```bash
 git clone https://github.com/sarthak2504/skypulse-travel-intelligence.git
@@ -357,10 +435,16 @@ gcloud services enable pubsub.googleapis.com storage.googleapis.com \
   iam.googleapis.com cloudbuild.googleapis.com run.googleapis.com \
   dataflow.googleapis.com bigquery.googleapis.com \
   bigquerystorage.googleapis.com dataproc.googleapis.com \
-  composer.googleapis.com container.googleapis.com
+  composer.googleapis.com container.googleapis.com \
+  secretmanager.googleapis.com
+
+# Or use Terraform (on fresh project)
+cd terraform
+terraform init
+terraform apply
 
 # Deploy Function B
-cd functions/function_b
+cd ../functions/function_b
 gcloud functions deploy function-b-price-ticker --gen2 --runtime=python311 \
   --region=us-central1 --source=. --entry-point=run --trigger-http \
   --memory=256MB --timeout=60s
@@ -383,7 +467,10 @@ gcloud composer environments storage dags import \
   --source=dags/skypulse_daily_dag.py
 ```
 
-Full setup documented in `commands.md`.
+### Snowflake Setup
+
+Run `snowflake/setup.sql` in order in a Snowflake worksheet.
+Full instructions in `commands.md`.
 
 ---
 

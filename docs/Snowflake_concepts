@@ -1,0 +1,573 @@
+# Snowflake — Concepts Reference Guide
+
+Built from the SkyPulse project. Covers architecture, features, limitations, and interview-ready answers.
+
+---
+
+## 1. What is Snowflake?
+
+Snowflake is a cloud-native data platform that separates storage and compute. Unlike traditional databases where storage and compute are tightly coupled, Snowflake lets you scale them independently.
+
+**The key insight:** You don't pay for compute when you're not querying. A warehouse (compute) can be suspended when idle and resumes in seconds when needed.
+
+Snowflake runs on AWS, Azure, and GCP simultaneously. Your data lives in one cloud; your compute can run anywhere.
+
+---
+
+## 2. Architecture — The Three Layers
+
+### Layer 1: Cloud Services
+The brain of Snowflake. Always running, no cost to you.
+- Query compilation and optimization
+- Authentication and access control
+- Metadata management (table schemas, statistics)
+- Transaction management
+
+### Layer 2: Query Processing (Virtual Warehouses)
+The muscle. You pay only when it's running.
+- Each warehouse is a cluster of VMs that execute queries
+- Multiple warehouses can run simultaneously on the same data
+- Auto-suspends when idle, auto-resumes on query
+
+### Layer 3: Database Storage
+The data. Stored in Snowflake's internal format (columnar, compressed).
+- Data is stored in cloud object storage (S3/GCS/Azure Blob) under the hood
+- Snowflake manages the format, compression, and partitioning
+- You pay per TB stored
+
+**Why this matters:** A BI team and a data science team can each have their own warehouse. They query the same data without competing for resources. Neither affects the other's performance.
+
+---
+
+## 3. Virtual Warehouses
+
+A virtual warehouse is Snowflake's compute unit — a cluster of VMs that run your queries.
+
+### Sizes
+| Size | Credits/hour | Use case |
+|---|---|---|
+| X-SMALL | 1 | Dev, light queries |
+| SMALL | 2 | Regular analytics |
+| MEDIUM | 4 | Complex queries |
+| LARGE | 8 | Heavy workloads |
+| X-LARGE | 16 | Very large datasets |
+| 2X-LARGE to 6X-LARGE | 32-512 | Massive parallelism |
+
+### Key settings we used
+```sql
+CREATE WAREHOUSE SKYPULSE_WH
+    WAREHOUSE_SIZE = 'X-SMALL'
+    AUTO_SUSPEND = 60        -- suspend after 60s idle
+    AUTO_RESUME = TRUE;      -- wake up on first query
+```
+
+### Multi-cluster warehouses
+For high concurrency, a warehouse can scale horizontally by adding clusters. If 100 users query simultaneously and a single cluster is saturated, Snowflake spins up additional clusters automatically.
+
+**Interview point:** Auto-suspend is critical for cost control. A warehouse left running overnight at X-SMALL costs 8 credits (~$1.60 at standard pricing). With AUTO_SUSPEND=60, it only runs when queries are executing.
+
+---
+
+## 4. Databases, Schemas, and Objects
+
+```
+Account
+  └── Database (SKYPULSE)
+        └── Schema (SILVER, GOLD, ANALYTICS)
+              └── Tables, Views, Dynamic Tables, Pipes, Stages, Semantic Views
+```
+
+### What we created
+```sql
+CREATE DATABASE SKYPULSE;
+CREATE SCHEMA SKYPULSE.SILVER;   -- raw ingested data
+CREATE SCHEMA SKYPULSE.GOLD;     -- analytics tables
+CREATE SCHEMA SKYPULSE.ANALYTICS; -- serving layer
+```
+
+---
+
+## 5. Data Loading — COPY INTO vs External Tables vs Iceberg
+
+### COPY INTO (internal tables) — what we used
+Data is physically copied into Snowflake's internal columnar storage.
+
+```sql
+COPY INTO raw_flights FROM @gcs_bronze_stage
+FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = TRUE);
+```
+
+**Pros:** Fastest queries, full Snowflake feature support, automatic optimization
+**Cons:** Storage cost in Snowflake + original storage (duplication), loading time for large datasets
+
+### External tables
+Data stays in GCS/S3. Snowflake queries it in place like Trino/Presto.
+
+```sql
+CREATE EXTERNAL TABLE raw_flights_ext
+    LOCATION = @gcs_bronze_stage
+    FILE_FORMAT = (TYPE = 'JSON');
+```
+
+**Pros:** No storage duplication, always fresh (no loading needed)
+**Cons:** Slower queries, limited Snowflake features (no Dynamic Tables, limited optimization)
+
+### Iceberg tables (newest approach)
+Snowflake reads Apache Iceberg format directly from your data lake.
+
+```sql
+CREATE ICEBERG TABLE flights
+    EXTERNAL_VOLUME = 'my_gcs_volume'
+    CATALOG = 'SNOWFLAKE'
+    BASE_LOCATION = 'bronze/routes/';
+```
+
+**Pros:** No copy, full Snowflake features, works with Spark/Flink/Trino too
+**Cons:** Requires Iceberg format, more setup
+
+### When to use which
+| Scenario | Approach |
+|---|---|
+| Small dataset, max query speed | COPY INTO |
+| Large historical archive | External table |
+| Active data lake with Iceberg | Iceberg table |
+| Hot/cold tiering | COPY INTO recent + External for historical |
+
+---
+
+## 6. Stages — Connecting External Storage
+
+A stage is a named pointer to a location where files live — either cloud storage or Snowflake's internal storage.
+
+### External stage (what we used)
+Points to GCS/S3/Azure:
+```sql
+CREATE STAGE gcs_bronze_stage
+    URL = 'gcs://skypulse-triptide/bronze/routes/'
+    STORAGE_INTEGRATION = gcs_skypulse_integration
+    FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = TRUE);
+```
+
+### Internal stage
+Snowflake manages the storage. Used for temporary file staging.
+
+```sql
+CREATE STAGE my_internal_stage;
+PUT file://local_file.csv @my_internal_stage;
+```
+
+### List files in a stage
+```sql
+LIST @gcs_bronze_stage;
+```
+
+---
+
+## 7. Storage Integrations — Cross-Cloud Authentication
+
+A storage integration lets Snowflake authenticate with external cloud storage without storing credentials.
+
+### How it works (what we did)
+1. Create integration in Snowflake → Snowflake generates a service account
+2. Grant that service account read access to your GCS bucket
+3. Snowflake uses the service account to authenticate with GCS
+
+```sql
+CREATE STORAGE INTEGRATION gcs_skypulse_integration
+    TYPE = EXTERNAL_STAGE
+    STORAGE_PROVIDER = 'GCS'
+    ENABLED = TRUE
+    STORAGE_ALLOWED_LOCATIONS = ('gcs://skypulse-triptide/');
+
+DESC INTEGRATION gcs_skypulse_integration;
+-- Returns STORAGE_GCP_SERVICE_ACCOUNT — grant this objectViewer on your bucket
+```
+
+**Key insight:** Snowflake maintains Google service accounts even when running on AWS. This enables cross-cloud data access without VPNs or network configuration — purely IAM-based.
+
+### For AWS S3
+Instead of a service account, Snowflake returns an IAM user ARN and external ID. You create a trust relationship in AWS IAM.
+
+---
+
+## 8. Snowpipe — Continuous Ingestion
+
+Snowpipe automatically loads new files as they arrive in a stage. No manual COPY INTO needed.
+
+```sql
+CREATE PIPE gcs_routes_pipe
+    AUTO_INGEST = FALSE
+AS
+COPY INTO raw_flights FROM @gcs_bronze_stage
+FILE_FORMAT = (TYPE = 'JSON' STRIP_OUTER_ARRAY = TRUE);
+```
+
+### AUTO_INGEST modes
+**AUTO_INGEST = TRUE** — requires cloud event notifications (GCS Pub/Sub, S3 SQS). New file event triggers Snowpipe automatically. True serverless ingestion.
+
+**AUTO_INGEST = FALSE** (what we used) — manually trigger via:
+```sql
+ALTER PIPE gcs_routes_pipe REFRESH;
+```
+Or call the Snowpipe REST API. Useful when cloud notifications aren't set up.
+
+### How Snowpipe works under the hood
+1. File arrives in GCS
+2. Event notification fires (if AUTO_INGEST=TRUE) or manual trigger
+3. Snowpipe picks up the file reference
+4. Micro-batch loading — files processed within seconds to minutes
+5. Exactly-once delivery — Snowpipe tracks which files have been loaded
+
+### Snowpipe vs COPY INTO
+| | Snowpipe | COPY INTO |
+|---|---|---|
+| Trigger | Automatic / event-driven | Manual / scheduled |
+| Latency | Seconds to minutes | On-demand |
+| Cost | Per-file compute cost | Warehouse compute |
+| Use case | Continuous ingestion | Batch loading |
+
+---
+
+## 9. Dynamic Tables — Automated Transformations
+
+Dynamic Tables are materialized views that automatically refresh when source data changes. No scheduler, no DAG, no manual refresh.
+
+```sql
+CREATE OR REPLACE DYNAMIC TABLE hourly_route_summary
+    TARGET_LAG = '1 hour'
+    WAREHOUSE = SKYPULSE_WH
+AS
+SELECT
+    route_id, origin, destination, date, season, is_weekend,
+    AVG(avg_price_usd) as avg_price,
+    COUNT(DISTINCT airline_name) as airline_count
+FROM SKYPULSE.GOLD.flight_price_summary
+GROUP BY route_id, origin, destination, date, season, is_weekend;
+```
+
+### TARGET_LAG
+How stale the Dynamic Table can be before Snowflake refreshes it. Options:
+- `'1 hour'` — refresh at most once per hour
+- `'5 minutes'` — near real-time
+- `'1 day'` — daily refresh
+- `DOWNSTREAM` — refresh only when queried
+
+### Dynamic Table chains
+Multiple Dynamic Tables can form a chain. When the source changes, Snowflake propagates the refresh through the chain automatically:
+
+```
+raw_flights → flight_price_summary (DT) → hourly_route_summary (DT)
+```
+
+When `raw_flights` gets new rows via Snowpipe, both downstream Dynamic Tables refresh according to their TARGET_LAG.
+
+### Dynamic Tables vs Regular Views vs Materialized Views
+| | Regular View | Materialized View | Dynamic Table |
+|---|---|---|---|
+| Data stored | No (computed on query) | Yes | Yes |
+| Refresh | Every query | Manual/scheduled | Automatic |
+| Supports aggregations | Yes | Limited | Yes |
+| Supports joins | Yes | Limited | Yes |
+| Cost | Warehouse per query | Storage + refresh | Storage + refresh |
+| Best for | Simple transformations | Pre-computed aggregates | Complex pipelines |
+
+---
+
+## 10. Semantic Views and Cortex Analyst
+
+### Semantic Views
+A Semantic View defines business vocabulary on top of your tables. It describes what columns mean in plain English, how metrics should be aggregated, and how tables relate.
+
+```sql
+CREATE OR REPLACE SEMANTIC VIEW flight_price_semantic_view
+TABLES (
+    hourly_route_summary PRIMARY KEY (route_id, date)
+)
+DIMENSIONS (
+    hourly_route_summary.route_id AS hourly_route_summary.route_id,
+    hourly_route_summary.season AS hourly_route_summary.season,
+    hourly_route_summary.is_weekend AS hourly_route_summary.is_weekend
+)
+METRICS (
+    hourly_route_summary.avg_price AS AVG(hourly_route_summary.avg_price),
+    hourly_route_summary.min_price AS MIN(hourly_route_summary.min_price)
+);
+```
+
+**Key concepts:**
+- **Dimensions** — categorical attributes used for filtering and grouping (route, season, weekend flag)
+- **Metrics** — numerical aggregations (average price, count, sum)
+- **Facts** — raw measures before aggregation (individual price values)
+
+### Cortex Analyst
+Cortex Analyst uses a Semantic View to answer plain English questions. It translates natural language to SQL and executes it.
+
+```
+User: "Which routes from Chicago are cheapest on summer weekends?"
+        ↓
+Cortex Analyst reads Semantic View (knows: route_id, season, is_weekend, avg_price)
+        ↓
+Generates SQL:
+    SELECT route_id, AVG(avg_price) as avg_price
+    FROM hourly_route_summary
+    WHERE is_weekend = TRUE AND season = 'Summer'
+    GROUP BY route_id ORDER BY avg_price ASC
+        ↓
+Returns: ORD-STL $112, ORD-IAH $138...
+```
+
+### Semantic Views vs YAML approach (legacy)
+Snowflake previously used YAML files uploaded to a stage. Semantic Views are now the recommended approach:
+- Native SQL object — no file management
+- Full RBAC and governance
+- Better tooling and IDE support
+- Can be versioned in git alongside other SQL
+
+---
+
+## 11. Snowflake Cortex ML Functions
+
+Beyond Cortex Analyst, Snowflake has built-in ML functions that run inside Snowflake's compute:
+
+### Forecasting
+```sql
+SELECT * FROM TABLE(
+    SNOWFLAKE.ML.FORECAST(
+        INPUT_DATA => SYSTEM$REFERENCE('TABLE', 'hourly_route_summary'),
+        SERIES_COLNAME => 'route_id',
+        TIMESTAMP_COLNAME => 'date',
+        TARGET_COLNAME => 'avg_price',
+        CONFIG_OBJECT => {'prediction_interval': 0.95}
+    )
+);
+```
+
+### Anomaly detection
+```sql
+SELECT * FROM TABLE(
+    SNOWFLAKE.ML.DETECT_ANOMALIES(
+        INPUT_DATA => SYSTEM$REFERENCE('TABLE', 'hourly_route_summary'),
+        SERIES_COLNAME => 'route_id',
+        TIMESTAMP_COLNAME => 'date',
+        TARGET_COLNAME => 'avg_price'
+    )
+);
+```
+
+### Classification and regression
+Snowflake also supports training and deploying ML models directly in SQL — no Python environment needed.
+
+---
+
+## 12. Snowpark — Python Inside Snowflake
+
+Snowpark lets you write Python (or Java/Scala) code that runs inside Snowflake's compute engine. The code is pushed down to Snowflake — your data never leaves.
+
+### Snowpark DataFrame API
+Similar to PySpark DataFrames but running on Snowflake:
+
+```python
+from snowflake.snowpark import Session
+
+session = Session.builder.configs(connection_params).create()
+
+df = session.table("SKYPULSE.SILVER.raw_flights")
+df_filtered = df.filter(df["departure_iata"] == "ORD")
+df_aggregated = df_filtered.group_by("arrival_iata").agg(
+    F.count("*").alias("flight_count"),
+    F.avg("avg_price_usd").alias("avg_price")
+)
+df_aggregated.write.save_as_table("SKYPULSE.GOLD.route_summary")
+```
+
+### Snowpark vs PySpark
+| | PySpark | Snowpark |
+|---|---|---|
+| Runs on | Spark cluster (EMR, Dataproc) | Snowflake warehouse |
+| Data location | HDFS, S3, GCS | Snowflake internal storage |
+| Language | Python, Scala, Java, R | Python, Java, Scala |
+| When to use | Large-scale ETL, ML pipelines | Snowflake-native transforms |
+
+### Snowpark User-Defined Functions (UDFs)
+```python
+@udf
+def classify_route(destination: str) -> str:
+    intl = ['LHR','CDG','NRT','PVG','AMS']
+    return 'International' if destination in intl else 'Domestic'
+
+session.call_udf('classify_route', df['arrival_iata'])
+```
+
+---
+
+## 13. Time Travel and Data Cloning
+
+### Time Travel
+Query any table as it existed at a point in the past:
+
+```sql
+-- How did the table look 1 hour ago?
+SELECT * FROM raw_flights AT (OFFSET => -3600);
+
+-- How did it look at a specific timestamp?
+SELECT * FROM raw_flights AT (TIMESTAMP => '2026-07-22 10:00:00'::TIMESTAMP_TZ);
+
+-- Restore a table to a previous state
+CREATE TABLE raw_flights_restored CLONE raw_flights
+    AT (TIMESTAMP => '2026-07-22 10:00:00'::TIMESTAMP_TZ);
+```
+
+**Retention period:** Standard = 1 day, Enterprise = up to 90 days.
+
+### Zero-Copy Cloning
+Create an instant copy of a table, schema, or database without duplicating data:
+
+```sql
+CREATE TABLE raw_flights_dev CLONE raw_flights;
+CREATE SCHEMA SKYPULSE.SILVER_DEV CLONE SKYPULSE.SILVER;
+CREATE DATABASE SKYPULSE_DEV CLONE SKYPULSE;
+```
+
+**How it works:** The clone shares the same underlying storage as the original. You only pay for storage when the clone diverges (new data written to it). Creating a clone of a 10TB table takes seconds and costs nothing initially.
+
+**Use cases:** Dev/test environments, A/B testing transformations, backup before risky migrations.
+
+---
+
+## 14. Snowflake Pricing Model
+
+### What you pay for
+1. **Compute** — credits per second the warehouse is running
+2. **Storage** — per TB per month (cheaper than most cloud storage)
+3. **Data transfer** — egress fees (minimal for same-region)
+4. **Snowpipe** — per file ingested
+
+### Credits
+1 credit = $2-4 depending on edition and region. X-SMALL warehouse = 1 credit/hour = $2-4/hour.
+
+### Cost optimization strategies
+- AUTO_SUSPEND on all warehouses
+- Size warehouses appropriately — don't use LARGE for a 10MB table
+- Use result cache — Snowflake caches query results for 24 hours; identical queries are free
+- Use clustering keys on large tables to prune partitions
+- Delete old Time Travel data by reducing retention period on large tables
+
+---
+
+## 15. Snowflake Architecture — Key Differentiators
+
+### Multi-cluster shared data
+Multiple warehouses (teams, workloads) read the same data simultaneously without locking or contention. This is impossible in traditional databases where compute and storage are coupled.
+
+### Micro-partitioning
+Snowflake automatically divides tables into micro-partitions (~50-500MB each). Each micro-partition stores metadata (min/max values per column). Queries skip partitions that can't contain relevant data — called **partition pruning**.
+
+```sql
+-- This query only reads partitions where flight_date = '2026-07-22'
+-- All other partitions are skipped automatically
+SELECT * FROM raw_flights WHERE flight_date = '2026-07-22';
+```
+
+### Result caching
+Query results are cached for 24 hours. If the same query runs again and the data hasn't changed, Snowflake returns the cached result instantly — zero warehouse credits used.
+
+### Automatic clustering
+For very large tables, you can define a clustering key. Snowflake continuously reorganizes micro-partitions to keep related data together, maintaining partition pruning efficiency as data grows.
+
+```sql
+ALTER TABLE fact_flight_prices CLUSTER BY (date, route_id);
+```
+
+---
+
+## 16. Snowflake vs BigQuery vs Redshift vs Databricks
+
+| Feature | Snowflake | BigQuery | Redshift | Databricks |
+|---|---|---|---|---|
+| Deployment | Multi-cloud | GCP only | AWS only | Multi-cloud |
+| Compute model | Virtual warehouses | Serverless slots | Cluster-based | Spark clusters |
+| Storage separation | Full | Full | Partial | Full (with Delta) |
+| Streaming ingestion | Snowpipe | Native streaming | Kinesis Firehose | Spark Streaming |
+| ML built-in | Cortex ML | BigQuery ML | None | MLflow/MLlib |
+| Natural language | Cortex Analyst | Gemini SQL | None | AI/BI Genie |
+| Best for | Analytics, multi-cloud | GCP-native analytics | AWS data warehouse | ML pipelines, lakehouse |
+| Pricing | Per-credit compute | Per-query bytes | Per-node-hour | Per-DBU |
+
+---
+
+## 17. Common Interview Questions
+
+**Q: How does Snowflake handle concurrency?**
+Multiple virtual warehouses can query the same data simultaneously without locking. Each warehouse is independent compute with its own resources. Storage is shared but read-only from a warehouse's perspective — writes go through Snowflake's cloud services layer which handles ACID transactions.
+
+**Q: What is micro-partitioning and why does it matter?**
+Snowflake divides tables into ~50-500MB micro-partitions stored in columnar format. Each partition has metadata tracking min/max values per column. When you filter on a column, Snowflake skips entire partitions whose min/max range excludes your filter value. This is called partition pruning and is automatic — no indexes to manage.
+
+**Q: What's the difference between a clustering key and an index?**
+Traditional databases use indexes — separate data structures maintained alongside the table. Snowflake uses clustering keys — hints that tell Snowflake how to organize micro-partitions. Clustering is automatic and continuous (Snowflake reorganizes partitions in the background). No manual index maintenance.
+
+**Q: How does Time Travel work under the hood?**
+Snowflake never modifies or deletes data files. When you update a row, Snowflake writes new micro-partitions with the updated data and marks the old ones as "deleted." Time Travel simply reads the old micro-partitions that haven't been garbage collected yet. After the retention period, old partitions are garbage collected.
+
+**Q: When would you use a Dynamic Table vs a scheduled dbt model?**
+Dynamic Tables: when you want automatic refresh based on data freshness guarantees, when you have a chain of transformations that should cascade automatically, when you want Snowflake to manage the refresh scheduling. dbt: when you need version control on transformations, testing frameworks, documentation generation, and a code-first approach to data modeling. They're complementary — many teams use dbt to define the logic and Dynamic Tables for the execution.
+
+**Q: What are Snowflake's limitations?**
+- Not designed for transactional workloads (OLTP) — use PostgreSQL/MySQL for that
+- UPDATE/DELETE operations are slower than inserts (micro-partition rewrites)
+- No row-level security without data masking policies (Enterprise feature)
+- External table query performance is slower than internal tables
+- Auto-suspend means first query after idle has latency (seconds to start warehouse)
+- Cannot run arbitrary code outside of Snowpark/UDFs
+
+**Q: How would you handle slowly changing dimensions in Snowflake?**
+Three approaches:
+1. **SCD Type 1** — just UPDATE the record (overwrite). Simple but loses history.
+2. **SCD Type 2** — INSERT new record with effective/expiry dates (what we did in BigQuery Gold). Preserves full history, enables point-in-time queries.
+3. **Snowflake Time Travel** — keep a simple table (SCD Type 1) and use Time Travel to query historical states. Elegant but limited to retention period.
+
+---
+
+## 18. Recommended Learning Resources
+
+### Official Snowflake Documentation
+- **Snowflake Docs:** docs.snowflake.com — comprehensive, well-organized
+- **Snowflake Quickstarts:** quickstarts.snowflake.com — hands-on tutorials
+- **Snowflake Blog:** snowflake.com/blog — architecture deep dives
+
+### Key documentation pages to read
+- [Virtual Warehouses](https://docs.snowflake.com/en/user-guide/warehouses-overview)
+- [Micro-partitions and Data Clustering](https://docs.snowflake.com/en/user-guide/tables-clustering-micropartitions)
+- [Dynamic Tables](https://docs.snowflake.com/en/user-guide/dynamic-tables-intro)
+- [Semantic Views](https://docs.snowflake.com/en/user-guide/views-semantic/overview)
+- [Cortex Analyst](https://docs.snowflake.com/en/user-guide/snowflake-cortex/cortex-analyst)
+- [Snowpark Developer Guide](https://docs.snowflake.com/en/developer-guide/snowpark/python/index)
+- [Time Travel](https://docs.snowflake.com/en/user-guide/data-time-travel)
+- [Snowpipe](https://docs.snowflake.com/en/user-guide/data-load-snowpipe-intro)
+
+### Certifications (in order of priority for your goals)
+1. **SnowPro Core** — foundational, covers all concepts above. Required for any Snowflake SA/FDE role.
+2. **SnowPro Advanced: Data Engineer** — focuses on pipelines, transformations, performance
+3. **SnowPro Advanced: Architect** — covers multi-cloud, governance, security
+
+### Practice
+- Snowflake free trial gives you $400 in credits and 30 days — enough to build and test everything
+- Snowflake Education: learn.snowflake.com — free courses including SnowPro Core prep
+- Hands-On Essentials courses on Snowflake Education portal (Badge series)
+
+---
+
+## 19. What We Built in SkyPulse — Snowflake Summary
+
+| Concept | What we built |
+|---|---|
+| Database/Schema/Warehouse | SKYPULSE database, SILVER/GOLD/ANALYTICS schemas, SKYPULSE_WH X-SMALL |
+| Storage Integration | GCS integration — Snowflake SA granted objectViewer on GCS bucket |
+| External Stage | gcs_bronze_stage → gs://skypulse-triptide/bronze/routes/ |
+| COPY INTO | Loaded 1,897 rows from 19 JSON files into SILVER.raw_flights |
+| Snowpipe | gcs_routes_pipe — auto-ingests new Bronze files daily |
+| Internal tables | GOLD.flight_price_summary, GOLD.route_stats |
+| Dynamic Table | ANALYTICS.hourly_route_summary — auto-refreshes every hour |
+| Semantic View | flight_price_semantic_view — dimensions + metrics for Cortex Analyst |
+| Cortex Analyst | Natural language queries — "show me flights from Chicago to Austin" |
+| Cross-cloud | Snowflake on AWS reading from GCS — IAM-based, no network config |
